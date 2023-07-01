@@ -5,9 +5,13 @@ application.yaml
 device.json
 Sora233-MiraiGo
 .lsp.db
+.lsp.db.lock
 DDBOT
 /.coverage.out
 /coverage.html
 /qrcode.png
 /qq-logs
 /session.token
+/dist/
+/template
+/version*.json

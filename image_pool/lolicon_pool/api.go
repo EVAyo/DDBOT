@@ -1,11 +1,10 @@
 package lolicon_pool
 
 import (
-	"context"
-	"github.com/Logiase/MiraiGo-Template/config"
 	"github.com/Sora233/DDBOT/proxy_pool"
 	"github.com/Sora233/DDBOT/requests"
 	"github.com/Sora233/DDBOT/utils"
+	"github.com/Sora233/MiraiGo-Template/config"
 	"time"
 )
 
@@ -55,7 +54,7 @@ type Setu struct {
 }
 
 func (s *Setu) Content() ([]byte, error) {
-	return utils.ImageGet(s.Url, proxy_pool.PreferOversea, requests.HeaderOption("referer", "https://www.pixiv.net"))
+	return utils.ImageGet(s.Url, requests.HeaderOption("referer", "https://www.pixiv.net"), requests.ProxyOption(proxy_pool.PreferOversea))
 }
 
 type Response struct {
@@ -79,14 +78,12 @@ func LoliconAppSetu(apikey string, R18 R18Type, keyword string, num int) (*Respo
 	if err != nil {
 		return nil, err
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), time.Second*15)
-	defer cancel()
-	resp, err := requests.Get(ctx, Host, params, 3, requests.ProxyOption(proxy_pool.PreferOversea))
-	if err != nil {
-		return nil, err
-	}
 	apiResp := new(Response)
-	err = resp.Json(apiResp)
+	err = requests.Get(Host, params, apiResp,
+		requests.RetryOption(3),
+		requests.TimeoutOption(time.Second*15),
+		requests.ProxyOption(proxy_pool.PreferOversea),
+	)
 	if err != nil {
 		return nil, err
 	}

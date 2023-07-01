@@ -3,13 +3,14 @@ package bilibili
 import (
 	"errors"
 	"fmt"
-	"github.com/Logiase/MiraiGo-Template/config"
+	"github.com/Sora233/DDBOT/proxy_pool"
 	"github.com/Sora233/DDBOT/requests"
+	"github.com/Sora233/MiraiGo-Template/config"
 	jsoniter "github.com/json-iterator/go"
+	"go.uber.org/atomic"
 	"strconv"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 )
 
@@ -22,16 +23,16 @@ const (
 	DynamicView  = "https://t.bilibili.com"
 	PassportHost = "https://passport.bilibili.com"
 
-	CompactExpireTime = time.Minute * 15
+	CompactExpireTime = time.Minute * 60
+	// followerNotifyCap 提示粉丝数过少的阈值
+	followerNotifyCap = 50
 )
 
 var json = jsoniter.ConfigCompatibleWithStandardLibrary
 
 var BasePath = map[string]string{
-	PathRoomInit:                 BaseLiveHost,
 	PathXSpaceAccInfo:            BaseHost,
 	PathDynamicSrvSpaceHistory:   BaseVCHost,
-	PathGetRoomInfoOld:           BaseLiveHost,
 	PathDynamicSrvDynamicNew:     BaseVCHost,
 	PathRelationModify:           BaseHost,
 	PathRelationFeedList:         BaseLiveHost,
@@ -39,6 +40,8 @@ var BasePath = map[string]string{
 	PathPassportLoginWebKey:      PassportHost,
 	PathPassportLoginOAuth2Login: PassportHost,
 	PathXRelationStat:            BaseHost,
+	PathXWebInterfaceNav:         BaseHost,
+	PathDynamicSrvDynamicHistory: BaseVCHost,
 }
 
 type VerifyInfo struct {
@@ -47,14 +50,35 @@ type VerifyInfo struct {
 	VerifyOpts []requests.Option
 }
 
-var (
-	ErrVerifyRequired = errors.New("verify required")
-	// atomicVerifyInfo is a *VerifyInfo
-	atomicVerifyInfo atomic.Value
+type ICode interface {
+	GetCode() int32
+}
 
-	mux      = new(sync.Mutex)
-	username string
-	password string
+var (
+	ErrVerifyRequired = errors.New("账号信息缺失")
+	atomicVerifyInfo  atomic.Pointer[VerifyInfo]
+
+	mux                  = new(sync.Mutex)
+	username             string
+	password             string
+	accountUid           atomic.Int64
+	wbi                  atomic.Pointer[WebInterfaceNavResponse_Data_WbiImg]
+	delete412ProxyOption = func() requests.Option {
+		return requests.ProxyCallbackOption(func(out interface{}, proxy string) {
+			if out == nil {
+				return
+			}
+			if c, ok := out.(ICode); ok && (c.GetCode() == -412 || c.GetCode() == 412) {
+				proxy_pool.Delete(proxy)
+			}
+		})
+	}()
+	mixinKeyEncTab = []int{
+		46, 47, 18, 2, 53, 8, 23, 32, 15, 50, 10, 31, 58, 3, 45, 35, 27, 43, 5, 49,
+		33, 9, 42, 19, 29, 28, 14, 39, 12, 38, 41, 13, 37, 48, 7, 16, 24, 55, 40,
+		61, 26, 17, 0, 1, 60, 51, 30, 4, 22, 25, 54, 21, 56, 59, 6, 63, 57, 62, 11,
+		36, 20, 34, 44, 52,
+	}
 )
 
 func Init() {
@@ -64,9 +88,9 @@ func Init() {
 	)
 	if len(SESSDATA) != 0 && len(biliJct) != 0 {
 		SetVerify(SESSDATA, biliJct)
+		FreshSelfInfo()
 	}
 	SetAccount(config.GlobalConfig.GetString("bilibili.account"), config.GlobalConfig.GetString("bilibili.password"))
-
 }
 
 func BPath(path string) string {
@@ -94,7 +118,7 @@ func SetVerify(_SESSDATA string, _biliJct string) {
 }
 
 func getVerify() *VerifyInfo {
-	return atomicVerifyInfo.Load().(*VerifyInfo)
+	return atomicVerifyInfo.Load()
 }
 
 func SetAccount(_username string, _password string) {
@@ -131,7 +155,7 @@ func GetVerifyInfo() *VerifyInfo {
 	}
 
 	if !IsAccountGiven() {
-		logger.Errorf("GetVerifyInfo error - 未设置cookie和帐号")
+		logger.Trace("GetVerifyInfo error - 未设置cookie和帐号")
 		return nil
 	} else {
 		var (
@@ -164,6 +188,7 @@ func GetVerifyInfo() *VerifyInfo {
 			} else {
 				ok = true
 				SetVerify(SESSDATA, biliJct)
+				FreshSelfInfo()
 				if expire > 0 {
 					// 尝试cookie过期之后自动刷新
 					// 但是登陆方法有效期应该比cookie有效期短
@@ -183,13 +208,42 @@ func GetVerifyInfo() *VerifyInfo {
 		}
 		if !ok {
 			SetVerify("wrong", "wrong")
+			FreshSelfInfo()
 		}
 	}
 	return getVerify()
 }
 
+func FreshSelfInfo() {
+	navResp, err := XWebInterfaceNav(true)
+	if err != nil {
+		logger.Errorf("获取个人信息失败 - %v，b站功能可能无法使用", err)
+	} else {
+		if navResp.GetCode() != 0 {
+			logger.Errorf("获取个人信息失败 - %v %v", navResp.GetCode(), navResp.GetMessage())
+		} else {
+			if navResp.GetData().GetIsLogin() {
+				logger.Infof("B站启动成功，当前使用账号：UID:%v %v LV%v %v",
+					navResp.GetData().GetMid(),
+					navResp.GetData().GetVipLabel().GetText(),
+					navResp.GetData().GetLevelInfo().GetCurrentLevel(),
+					navResp.GetData().GetUname())
+				if navResp.GetData().GetLevelInfo().GetCurrentLevel() >= 5 {
+					logger.Warnf("注意：当前使用的B站账号为5级或以上，请注意使用b站订阅时，该账号会自动关注订阅的目标用户！" +
+						"如果不想新增关注，请使用小号。")
+				}
+				accountUid.Store(navResp.GetData().GetMid())
+				return
+			} else {
+				logger.Errorf("账号未登陆")
+			}
+		}
+	}
+	accountUid.Store(0)
+}
+
 func AddUAOption() requests.Option {
-	return requests.AddUAOption()
+	return requests.AddRandomUAOption(requests.Computer)
 }
 
 func AddReferOption(refer ...string) requests.Option {
@@ -211,11 +265,7 @@ func IsCookieGiven() bool {
 	if v == nil {
 		return false
 	}
-	info, ok := v.(*VerifyInfo)
-	if !ok {
-		return false
-	}
-	return len(info.VerifyOpts) > 0
+	return len(v.VerifyOpts) > 0
 }
 
 func IsAccountGiven() bool {
@@ -226,6 +276,7 @@ func IsAccountGiven() bool {
 }
 
 func ParseUid(s string) (int64, error) {
+	// 手机端复制的时候会带上UID:前缀，所以支持这个格式
 	s = strings.TrimPrefix(strings.ToUpper(s), "UID:")
 	return strconv.ParseInt(s, 10, 64)
 }

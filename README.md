@@ -2,8 +2,10 @@
 
 [<img src="https://github.com/Sora233/DDBOT/actions/workflows/ci.yml/badge.svg"/>](https://github.com/Sora233/DDBOT/actions/workflows/ci.yml)
 [<img src="https://coveralls.io/repos/github/Sora233/DDBOT/badge.svg?branch=master"/>](https://coveralls.io/github/Sora233/DDBOT)
+[![GoDoc](http://img.shields.io/badge/go-documentation-blue.svg?style=flat-square)](https://pkg.go.dev/github.com/Sora233/DDBOT)
 
-DDBOT是一个基于 [MiraiGO](https://github.com/Mrs4s/MiraiGo) 的QQ群推送机器人，支持b站直播/动态，斗鱼直播，YTB直播/预约直播，虎牙直播。
+DDBOT是一个基于 [MiraiGO](https://github.com/Mrs4s/MiraiGo) 的QQ群推送框架， 内置支持b站直播/动态，斗鱼直播，YTB直播/预约直播，虎牙直播，ACFUN直播，微博动态，
+也可以通过插件支持任何订阅源。
 
 *DDBOT不是一个聊天机器人。*
 
@@ -21,27 +23,32 @@ DDBOT是一个基于 [MiraiGO](https://github.com/Mrs4s/MiraiGo) 的QQ群推送�
 ## **基本功能：**
 
 - **B站直播/动态推送**
-    - 让阁下在DD的时候不错过任何一场突击。
+  - 让阁下在DD的时候不错过任何一场突击。
+  - 支持按关键字过滤，只推送有关键字的动态。
+  - 支持按动态类型过滤，例如：不推送转发的动态，只推送视频/专栏投稿，只推动带图片的动态等等。
 - **斗鱼直播推送**
-    - 没什么用，主要用来看爽哥。
+  - 没什么用，主要用来看爽哥。
 - **油管直播/视频推送**
-    - 支持推送预约直播信息及视频更新。
-- **虎牙直播推送** *新增*
-    - 不知道能看谁。
-- 可配置的 **@全体成员** *新增*
-    - 只建议单推群开启。
-- **人脸识别**
-    - 主要用来玩，支持二次元人脸。
+  - 支持推送预约直播信息及视频更新。
+- **虎牙直播推送**
+  - 不知道能看谁。
+- **ACFUN直播推送**
+  - 好像也有一些虚拟主播
+- **微博动态推送**
+- 支持自定义**插件**，可通过插件支持任意订阅来源
+  - 需要写代码
+- 可配置的 **@全体成员**
+  - 只建议单推群开启。
 - **倒放**
-    - 主要用来玩。
+  - 主要用来玩。
 - **Roll**
-    - 没什么用的roll点。
+  - 没什么用的roll点。
 - **签到**
-    - 没什么用的签到。
+  - 没什么用的签到。
 - **权限管理**
-    - 可配置整个命令的启用和禁用，也可对单个用户配置命令权限，防止滥用。
+  - 可配置整个命令的启用和禁用，也可对单个用户配置命令权限，防止滥用。
 - **帮助**
-    - 输出一些没什么帮助的信息。
+  - 输出一些没什么帮助的信息。
 
 <details>
   <summary>里命令</summary>
@@ -49,7 +56,7 @@ DDBOT是一个基于 [MiraiGO](https://github.com/Mrs4s/MiraiGo) 的QQ群推送�
 以下命令默认禁用，使用enable命令后才能使用
 
 - **随机图片**
-    - 由 [api.olicon.app](https://api.lolicon.app/#/) 提供
+  - 由 [api.lolicon.app](https://api.lolicon.app/#/) 提供
 
 </details>
 
@@ -61,26 +68,9 @@ DDBOT是一个基于 [MiraiGO](https://github.com/Mrs4s/MiraiGo) 的QQ群推送�
 
 详细介绍及示例请查看：[详细示例](/EXAMPLE.md)
 
-阁下可添加官方Demo机器人体验，QQ号：
+~~阁下可添加官方Demo机器人体验~~
 
-- ~~368236249 （二号机）~~
-- 1561991863 （初号机）
-
-<details>
-<summary>点此扫码二号机</summary>
-<img src="https://user-images.githubusercontent.com/11474360/122684719-a8afe280-d239-11eb-9089-b8ce6613c819.jpg" width="300" height="450">
-</details>
-
-<details>
-<summary>点此扫码初号机</summary>
-<img src="https://user-images.githubusercontent.com/11474360/108590360-150afa00-739e-11eb-86f7-77f68d845505.jpeg" width="300" height="450">
-</details>
-
-~~推荐您优先选择二号机，由于目前初号机负载较高。~~
-
-二号机暂时关闭，请选择初号机或者私人部署。
-
-**尝试同时使用多个官方Demo机器人会导致您被暂时加入黑名单**
+不再提供官方的公开BOT，你可以加入交流群申请使用群友搭建的BOT，也可以选择自己搭建。
 
 ## 使用与部署
 
@@ -102,14 +92,25 @@ DDBOT是一个基于 [MiraiGO](https://github.com/Mrs4s/MiraiGo) 的QQ群推送�
 
 请参考[更新文档](/UPDATE.md)。
 
-NOTE：DDBOT正在进行重构，目前已经支持为DDBOT编写插件，来支持新的网站和订阅类型，如果您对此有兴趣，请查看[开发版本](https://github.com/Sora233/DDBOT/tree/refactor/concern#%E5%A2%9E%E5%8A%A0%E6%8E%A8%E9%80%81%E6%9D%A5%E6%BA%90)
-。
-
-**警告：开发版本目前尚处于实验阶段，无法兼容稳定版本，稳定版本下的订阅无法迁移到开发版本，如果您之前运行了稳定版本，请注意备份数据。**
-
 ## 常见问题FAQ
 
 提问前请先查看[FAQ文档](/FAQ.md)，如果仍然未能解决，请咨询唯一指定交流群。
+
+## 增加推送来源 （为DDBOT编写插件）
+
+DDBOT可以作为一个通用的QQ推送框架来使用。
+
+您可以通过为DDBOT编写插件，DDBOT会为您完成大部分工作，您只需要实现少量代码，就能支持一个新的来源。
+
+如果您对此有兴趣，请查看[框架文档](/FRAMEWORK.md) 。
+
+## 自定义消息模板 & 自定义命令回复
+
+DDBOT已实现消息模板功能，一些内置命令和推送可通过模板自定义格式。
+
+同时支持自定义命令，自动回复模板内容。
+
+详细介绍请看[模板文档](/TEMPLATE.md) 。
 
 ## 注意事项
 
@@ -130,26 +131,6 @@ NOTE：DDBOT正在进行重构，目前已经支持为DDBOT编写插件，来支
 
 *Feel free to make your first pull request.*
 
-DDBOT使用 [MiraiGO-Template](https://github.com/Logiase/MiraiGo-Template) 进行开发，如果您使用了该框架，您可以将DDBOT嵌入您的程序里。
-
-DDBOT提供一些可以使用的module：
-
-- github.com/Sora233/DDBOT/lsp
-
-该module即是DDBOT，嵌入DDBOT时需要引入这个module，同时需要在`bot.RefreshList()`这一行后面增加`lsp.Instance.PostStart(bot.Instance)`
-
-- github.com/Sora233/DDBOT/msg-marker
-
-该module可以自动把群聊和私聊消息标记为已读，go-cqhttp使用该机制来减少bot被识别。
-
-- github.com/Sora233/DDBOT/logging
-
-该module可以自动把消息内容打印到标准输出和`qq-logs`文件夹内。
-
-- github.com/Sora233/DDBOT/miraigo-logging
-
-该module可以自动把miraigo的日志打印到`miraigo-logs`内（用于帮助定位miraigo内部问题，所以不输出到标准输出）。
-
 想要为开源做一点微小的贡献？
 
 [Golang点我入门！](https://github.com/justjavac/free-programming-books-zh_CN#go)
@@ -164,13 +145,28 @@ DDBOT提供一些可以使用的module：
 
 （排名按时间先后顺序）
 
-|赞助者|渠道|金额|
-|-----|----|----|
-|VE-H Maw|爱发电|￥30.00|
-|饱受突击的3737民|爱发电|￥168.00|
-|刀光流水|爱发电|￥5.00|
-|爱发电用户_4QBx|爱发电|￥5.00|
-|XDMrSmile_鸟鸟|爱发电|￥30.00|
+| 赞助者          | 渠道  | 金额      |
+|--------------|-----|---------|
+| VE-H Maw     | 爱发电 | ￥30.00  |
+| 饱受突击的3737民   | 爱发电 | ￥168.00 |
+| 刀光流水         | 爱发电 | ￥5.00   |
+| 爱发电用户_4QBx   | 爱发电 | ￥5.00   |
+| XDMrSmile_鸟鸟 | 爱发电 | ￥120.00 |
+| 别赋清颜         | 爱发电 | ￥300.00 |
+| 赫尔博达         | 爱发电 | ￥50.00  |
+| 冰王星          | 爱发电 | ￥5.00   |
+| yzr6991      | 爱发电 | ￥30.00  |
+| 么鱼           | 爱发电 | ￥5.00   |
+| Darren今天社恐了嘛 | 爱发电 | ￥5.00   |
+| Ed😓         | 爱发电 | ￥5.00   |
+| 殿九           | 爱发电 | ￥30.00  |
+| ACR          | 爱发电 | ￥50.00  |
+| 南宫           | 爱发电 | ￥30.00  |
+| 宇            | QQ  | ￥100.00 |
+| 殿九           | QQ  | ￥50.00  |
+| 梦幻七罪         | 爱发电 | ￥5.00   |
+| 电子鸽子         | 爱发电 | ￥30.00  |
+| 星落泪羽         | 爱发电 | ￥30.00  |
 
 ## 鸣谢
 

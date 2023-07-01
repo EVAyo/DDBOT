@@ -2,6 +2,7 @@ package buntdb
 
 import (
 	"errors"
+	"fmt"
 	"reflect"
 	"strconv"
 	"strings"
@@ -13,6 +14,9 @@ func Key(keys ...interface{}) string {
 	var _keys []string
 	for _, ikey := range keys {
 		rk := reflect.ValueOf(ikey)
+		if !rk.IsValid() {
+			panic(fmt.Sprintf("invalid value %T %v", ikey, ikey))
+		}
 		if rk.Kind() == reflect.Ptr || rk.Kind() == reflect.Interface {
 			rk = rk.Elem()
 		}
@@ -82,6 +86,9 @@ func BilibiliCompactMarkKey(keys ...interface{}) string {
 func BilibiliNotifyMsgKey(keys ...interface{}) string {
 	return NamedKey("NotifyMsg", keys)
 }
+func BilibiliActiveTimestampKey(keys ...interface{}) string {
+	return NamedKey("ActiveTimestamp", keys)
+}
 func BilibiliLastFreshKey(keys ...interface{}) string {
 	return NamedKey("BilibiliLastFresh", keys)
 }
@@ -136,6 +143,28 @@ func HuyaCurrentLiveKey(keys ...interface{}) string {
 func HuyaGroupAtAllMarkKey(keys ...interface{}) string {
 	return NamedKey("HuyaGroupAtAll", keys)
 }
+func AcfunUserInfoKey(keys ...interface{}) string {
+	return NamedKey("AcfunUserInfo", keys)
+}
+func AcfunLiveInfoKey(keys ...interface{}) string {
+	return NamedKey("AcfunLiveInfo", keys)
+}
+func AcfunNotLiveKey(keys ...interface{}) string {
+	return NamedKey("AcfunNotLiveCount", keys)
+}
+func AcfunUidFirstTimestampKey(keys ...interface{}) string {
+	return NamedKey("AcfunUidFirstTimestamp", keys)
+}
+func WeiboUserInfoKey(keys ...interface{}) string {
+	return NamedKey("WeiboUserInfo", keys)
+}
+func WeiboNewsInfoKey(keys ...interface{}) string {
+	return NamedKey("WeiboNewsInfo", keys)
+}
+func WeiboMarkMblogIdKey(keys ...interface{}) string {
+	return NamedKey("WeiboMarkMblogId", keys)
+}
+
 func PermissionKey(keys ...interface{}) string {
 	return NamedKey("Permission", keys)
 }
@@ -187,6 +216,14 @@ func GroupInvitedKey(keys ...interface{}) string {
 
 func VersionKey(keys ...interface{}) string {
 	return NamedKey("Version", keys)
+}
+
+func DDBotReleaseKey(keys ...interface{}) string {
+	return NamedKey("DDBotReleaseKey", keys)
+}
+
+func DDBotNoUpdateKey(keys ...interface{}) string {
+	return NamedKey("DDBotNoUpdateKey", keys)
 }
 
 func ParseConcernStateKeyWithInt64(key string) (groupCode int64, id int64, err error) {

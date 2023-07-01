@@ -1,31 +1,29 @@
 package lsp
 
 import (
-	"bytes"
 	"fmt"
-	miraiBot "github.com/Logiase/MiraiGo-Template/bot"
-	"github.com/Logiase/MiraiGo-Template/config"
-	"github.com/Mrs4s/MiraiGo/message"
-	"github.com/Sora233/DDBOT/concern"
-	"github.com/Sora233/DDBOT/image_pool"
-	"github.com/Sora233/DDBOT/image_pool/lolicon_pool"
-	"github.com/Sora233/DDBOT/lsp/bilibili"
-	localdb "github.com/Sora233/DDBOT/lsp/buntdb"
-	"github.com/Sora233/DDBOT/lsp/permission"
-	"github.com/Sora233/DDBOT/lsp/youtube"
-	"github.com/Sora233/DDBOT/proxy_pool"
-	"github.com/Sora233/DDBOT/utils"
-	"github.com/Sora233/sliceutil"
-	"github.com/alecthomas/kong"
-	"github.com/sirupsen/logrus"
-	"github.com/tidwall/buntdb"
+	"github.com/Sora233/DDBOT/lsp/concern"
+	"github.com/Sora233/DDBOT/lsp/template"
+	"go.uber.org/atomic"
 	"math/rand"
 	"runtime/debug"
 	"strconv"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
+
+	"github.com/Mrs4s/MiraiGo/message"
+	"github.com/Sora233/DDBOT/image_pool"
+	"github.com/Sora233/DDBOT/image_pool/lolicon_pool"
+	localdb "github.com/Sora233/DDBOT/lsp/buntdb"
+	"github.com/Sora233/DDBOT/lsp/concern_type"
+	"github.com/Sora233/DDBOT/lsp/mmsg"
+	"github.com/Sora233/DDBOT/lsp/permission"
+	"github.com/Sora233/DDBOT/utils"
+	"github.com/Sora233/MiraiGo-Template/config"
+	"github.com/Sora233/sliceutil"
+	"github.com/alecthomas/kong"
+	"github.com/sirupsen/logrus"
 )
 
 type LspGroupCommand struct {
@@ -34,9 +32,9 @@ type LspGroupCommand struct {
 	*Runtime
 }
 
-func NewLspGroupCommand(bot *miraiBot.Bot, l *Lsp, msg *message.GroupMessage) *LspGroupCommand {
+func NewLspGroupCommand(l *Lsp, msg *message.GroupMessage) *LspGroupCommand {
 	c := &LspGroupCommand{
-		Runtime: NewRuntime(bot, l, l.PermissionStateManager.CheckGroupSilence(msg.GroupCode)),
+		Runtime: NewRuntime(l, l.PermissionStateManager.CheckGroupSilence(msg.GroupCode)),
 		msg:     msg,
 	}
 	c.Parse(msg.Elements)
@@ -67,13 +65,14 @@ func (lgc *LspGroupCommand) Execute() {
 		}
 	}()
 
-	if !strings.HasPrefix(lgc.GetCmd(), "/") {
+	if len(lgc.CommandName()) == 0 {
 		return
 	}
 
 	log := lgc.DefaultLogger().WithField("cmd", lgc.GetCmdArgs())
 
-	if lgc.l.PermissionStateManager.CheckBlockList(lgc.uin()) {
+	if lgc.l.PermissionStateManager.CheckBlockList(lgc.uin()) ||
+		lgc.l.PermissionStateManager.CheckBlockList(lgc.groupCode()) {
 		log.Debug("blocked")
 		return
 	}
@@ -90,16 +89,16 @@ func (lgc *LspGroupCommand) Execute() {
 
 	log.Debug("execute command")
 
-	switch lgc.GetCmd() {
-	case "/lsp":
+	switch lgc.CommandName() {
+	case LspCommand:
 		if lgc.requireNotDisable(LspCommand) {
 			lgc.LspCommand()
 		}
-	case "/色图":
+	case SetuCommand:
 		if lgc.requireEnable(SetuCommand) {
 			lgc.SetuCommand(false)
 		}
-	case "/黄图":
+	case HuangtuCommand:
 		if lgc.requireEnable(HuangtuCommand) {
 			if lgc.l.PermissionStateManager.RequireAny(
 				permission.AdminRoleRequireOption(lgc.uin()),
@@ -108,81 +107,105 @@ func (lgc *LspGroupCommand) Execute() {
 				lgc.SetuCommand(true)
 			}
 		}
-	case "/watch":
+	case WatchCommand:
 		if lgc.requireNotDisable(WatchCommand) {
 			lgc.WatchCommand(false)
 		}
-	case "/unwatch":
+	case UnwatchCommand:
 		if lgc.requireNotDisable(WatchCommand) {
 			lgc.WatchCommand(true)
 		}
-	case "/list":
+	case ListCommand:
 		if lgc.requireNotDisable(ListCommand) {
 			lgc.ListCommand()
 		}
-	case "/config":
+	case ConfigCommand:
 		if lgc.requireNotDisable(ConfigCommand) {
 			lgc.ConfigCommand()
 		}
-	case "/签到":
+	case CheckinCommand:
 		if lgc.requireNotDisable(CheckinCommand) {
 			lgc.CheckinCommand()
 		}
-	case "/查询积分":
-		if lgc.requireNotDisable(ScoreCommand) {
-			lgc.ScoreCommand()
-		}
-	case "/roll":
+	case RollCommand:
 		if lgc.requireNotDisable(RollCommand) {
 			lgc.RollCommand()
 		}
-	case "/grant":
-		lgc.GrantCommand()
-	case "/enable":
-		lgc.EnableCommand(false)
-	case "/disable":
-		lgc.EnableCommand(true)
-	case "/silence":
-		lgc.SilenceCommand()
-	case "/face":
-		if lgc.requireNotDisable(FaceCommand) {
-			lgc.FaceCommand()
+	case ScoreCommand:
+		if lgc.requireNotDisable(ScoreCommand) {
+			lgc.ScoreCommand()
 		}
-	case "/倒放":
+	case GrantCommand:
+		lgc.GrantCommand()
+	case EnableCommand:
+		lgc.EnableCommand(false)
+	case DisableCommand:
+		lgc.EnableCommand(true)
+	case SilenceCommand:
+		lgc.SilenceCommand()
+	case ReverseCommand:
 		if lgc.requireNotDisable(ReverseCommand) {
 			lgc.ReverseCommand()
 		}
-	case "/help":
+	case HelpCommand:
 		if lgc.requireNotDisable(HelpCommand) {
 			lgc.HelpCommand()
 		}
+	case CleanConcern:
+		if lgc.requireNotDisable(CleanConcern) {
+			if lgc.l.PermissionStateManager.RequireAny(
+				permission.AdminRoleRequireOption(lgc.uin()),
+				permission.GroupAdminRoleRequireOption(lgc.groupCode(), lgc.uin()),
+			) {
+				lgc.CleanConcernCommand()
+			}
+		}
 	default:
-		log.Debug("no command matched")
+		if CheckCustomGroupCommand(lgc.CommandName()) {
+			if lgc.requireNotDisable(lgc.CommandName()) {
+				func() {
+					log := lgc.DefaultLoggerWithCommand(lgc.CommandName()).WithField("CustomCommand", true)
+					log.Infof("run %v command", lgc.CommandName())
+					defer func() { log.Infof("%v command end", lgc.CommandName()) }()
+					lgc.sendChain(
+						lgc.templateMsg(fmt.Sprintf("custom.command.group.%s.tmpl", lgc.CommandName()),
+							map[string]interface{}{
+								"cmd":        lgc.CommandName(),
+								"args":       lgc.GetArgs(),
+								"full_args":  strings.Join(lgc.GetArgs(), " "),
+								"at_targets": lgc.GetAtArgs(),
+							},
+						),
+					)
+				}()
+			}
+		} else {
+			log.Debug("no command matched")
+		}
 	}
 	return
 }
 
 func (lgc *LspGroupCommand) LspCommand() {
-	log := lgc.DefaultLoggerWithCommand(LspCommand)
-	log.Infof("run lsp command")
-	defer func() { log.Info("lsp command end") }()
+	log := lgc.DefaultLoggerWithCommand(lgc.CommandName())
+	log.Infof("run %v command", lgc.CommandName())
+	defer func() { log.Infof("%v command end", lgc.CommandName()) }()
 
 	var lspCmd struct{}
-	_, output := lgc.parseCommandSyntax(&lspCmd, LspCommand)
+	_, output := lgc.parseCommandSyntax(&lspCmd, lgc.CommandName())
 	if output != "" {
 		lgc.textReply(output)
 	}
 	if lgc.exit {
 		return
 	}
-	lgc.textReply("LSP竟然是你")
-	return
+	lgc.sendChain(lgc.templateMsg("command.group.lsp.tmpl", nil))
 }
 
 func (lgc *LspGroupCommand) SetuCommand(r18 bool) {
-	log := lgc.DefaultLoggerWithCommand(SetuCommand)
-	log.Info("run setu command")
-	defer func() { log.Info("setu command end") }()
+	log := lgc.DefaultLoggerWithCommand(lgc.CommandName())
+	log.Infof("run %v command", lgc.CommandName())
+	defer func() { log.Infof("%v command end", lgc.CommandName()) }()
 
 	if !lgc.l.status.ImagePoolEnable {
 		log.Debug("image pool not setup")
@@ -193,13 +216,8 @@ func (lgc *LspGroupCommand) SetuCommand(r18 bool) {
 		Num int    `arg:"" optional:"" help:"image number"`
 		Tag string `optional:"" short:"t" help:"image tag"`
 	}
-	var name string
-	if r18 {
-		name = "黄图"
-	} else {
-		name = "色图"
-	}
-	_, output := lgc.parseCommandSyntax(&setuCmd, name)
+
+	_, output := lgc.parseCommandSyntax(&setuCmd, lgc.CommandName())
 	if output != "" {
 		lgc.textReply(output)
 	}
@@ -297,7 +315,7 @@ func (lgc *LspGroupCommand) SetuCommand(r18 bool) {
 		imgBatch = 5
 	}
 
-	var missCount int32 = 0
+	var missCount atomic.Int32
 
 	for i := 0; i < len(groupImages); i += imgBatch {
 		last := i + imgBatch
@@ -307,17 +325,17 @@ func (lgc *LspGroupCommand) SetuCommand(r18 bool) {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
-			sendingMsg := message.NewSendingMessage()
+			msg := mmsg.NewMSG()
 			var imgSubCount int32 = 0
 			for index, groupImage := range groupImages[i:last] {
 				if errs[i+index] != nil {
 					log.Errorf("upload failed %v", errs[i+index])
-					atomic.AddInt32(&missCount, 1)
+					missCount.Add(1)
 					continue
 				}
 				imgSubCount += 1
 				img := imgs[i+index]
-				sendingMsg.Append(groupImage)
+				msg.Append(groupImage)
 				if loliconImage, ok := img.(*lolicon_pool.Setu); ok {
 					log.WithFields(logrus.Fields{
 						"Author":    loliconImage.Author,
@@ -327,22 +345,22 @@ func (lgc *LspGroupCommand) SetuCommand(r18 bool) {
 						"Title":     loliconImage.Title,
 						"UploadUrl": groupImage.Url,
 					}).Debug("debug image")
-					sendingMsg.Append(utils.MessageTextf("标题：%v\n", loliconImage.Title))
-					sendingMsg.Append(utils.MessageTextf("作者：%v\n", loliconImage.Author))
-					sendingMsg.Append(utils.MessageTextf("PID：%v P%v\n", loliconImage.Pid, loliconImage.P))
+					msg.Textf("标题：%v\n", loliconImage.Title)
+					msg.Textf("作者：%v\n", loliconImage.Author)
+					msg.Textf("PID：%v P%v\n", loliconImage.Pid, loliconImage.P)
 					tagCount := len(loliconImage.Tags)
 					if tagCount >= 2 {
 						tagCount = 2
 					}
-					sendingMsg.Append(utils.MessageTextf("TAG：%v\n", strings.Join(loliconImage.Tags[:tagCount], " ")))
-					sendingMsg.Append(utils.MessageTextf("R18：%v", loliconImage.R18))
+					msg.Textf("TAG：%v\n", strings.Join(loliconImage.Tags[:tagCount], " "))
+					msg.Textf("R18：%v", loliconImage.R18)
 				}
 			}
-			if len(sendingMsg.Elements) == 0 {
+			if len(msg.Elements()) == 0 {
 				return
 			}
-			if lgc.reply(sendingMsg).Id == -1 {
-				atomic.AddInt32(&missCount, imgSubCount)
+			if lgc.reply(msg).Id == -1 {
+				missCount.Add(imgSubCount)
 			}
 		}(i)
 	}
@@ -350,8 +368,8 @@ func (lgc *LspGroupCommand) SetuCommand(r18 bool) {
 	wg.Wait()
 
 	log = log.WithField("search_num", searchNum).WithField("miss", missCount)
-	if searchNum != num || missCount != 0 {
-		lgc.textReplyF("本次共查询到%v张图片，有%v张图片被吞了哦", searchNum, missCount)
+	if searchNum != num || missCount.Load() != 0 {
+		lgc.textReplyF("本次共查询到%v张图片，有%v张图片被吞了哦", searchNum, missCount.Load())
 	}
 
 	return
@@ -360,27 +378,24 @@ func (lgc *LspGroupCommand) SetuCommand(r18 bool) {
 func (lgc *LspGroupCommand) WatchCommand(remove bool) {
 	var (
 		groupCode = lgc.groupCode()
-		site      = bilibili.Site
-		watchType = concern.BibiliLive
+		site      string
+		watchType = concern_type.Type("live")
 		err       error
 	)
 
-	log := lgc.DefaultLoggerWithCommand(WatchCommand)
-	log.Info("run watch command")
-	defer func() { log.Info("watch command end") }()
+	log := lgc.DefaultLoggerWithCommand(lgc.CommandName())
+	log.Infof("run %v command", lgc.CommandName())
+	defer func() { log.Infof("%v command end", lgc.CommandName()) }()
 
 	var watchCmd struct {
-		Site string `optional:"" short:"s" default:"bilibili" help:"bilibili / douyu / youtube / huya"`
-		Type string `optional:"" short:"t" default:"live" help:"news / live"`
+		Site string `optional:"" short:"s" default:"bilibili" help:"网站参数"`
+		Type string `optional:"" short:"t" default:"" help:"类型参数"`
 		Id   string `arg:""`
 	}
-	var name string
-	if remove {
-		name = "unwatch"
-	} else {
-		name = "watch"
-	}
-	_, output := lgc.parseCommandSyntax(&watchCmd, name)
+
+	_, output := lgc.parseCommandSyntax(&watchCmd, lgc.CommandName(), kong.Description(
+		fmt.Sprintf("当前支持的网站：%v", strings.Join(concern.ListSite(), "/"))),
+	)
 	if output != "" {
 		lgc.textReply(output)
 	}
@@ -391,7 +406,7 @@ func (lgc *LspGroupCommand) WatchCommand(remove bool) {
 	site, watchType, err = lgc.ParseRawSiteAndType(watchCmd.Site, watchCmd.Type)
 	if err != nil {
 		log = log.WithField("args", lgc.GetArgs())
-		log.Errorf("parse raw concern failed %v", err)
+		log.Errorf("ParseRawSiteAndType failed %v", err)
 		lgc.textReply(fmt.Sprintf("参数错误 - %v", err))
 		return
 	}
@@ -405,15 +420,14 @@ func (lgc *LspGroupCommand) WatchCommand(remove bool) {
 func (lgc *LspGroupCommand) ListCommand() {
 	groupCode := lgc.groupCode()
 
-	log := lgc.DefaultLoggerWithCommand(ListCommand)
-	log.Info("run list command")
-	defer func() { log.Info("list command end") }()
+	log := lgc.DefaultLoggerWithCommand(lgc.CommandName())
+	log.Infof("run %v command", lgc.CommandName())
+	defer func() { log.Infof("%v command end", lgc.CommandName()) }()
 
 	var listCmd struct {
-		Site string `optional:"" short:"s" help:"已弃用"`
-		Type string `optional:"" short:"t" help:"已弃用"`
+		Site string `optional:"" short:"s" help:"网站参数"`
 	}
-	_, output := lgc.parseCommandSyntax(&listCmd, ListCommand)
+	_, output := lgc.parseCommandSyntax(&listCmd, lgc.CommandName())
 	if output != "" {
 		lgc.textReply(output)
 	}
@@ -421,23 +435,18 @@ func (lgc *LspGroupCommand) ListCommand() {
 		return
 	}
 
-	if listCmd.Site != "" || listCmd.Type != "" {
-		lgc.textReply("命令已更新，请直接输入/list即可")
-		return
-	}
-
-	IList(lgc.NewMessageContext(log), groupCode)
+	IList(lgc.NewMessageContext(log), groupCode, listCmd.Site)
 }
 
 func (lgc *LspGroupCommand) RollCommand() {
-	log := lgc.DefaultLoggerWithCommand(RollCommand)
-	log.Info("run roll command")
-	defer func() { log.Info("roll command end") }()
+	log := lgc.DefaultLoggerWithCommand(lgc.CommandName())
+	log.Infof("run %v command", lgc.CommandName())
+	defer func() { log.Infof("%v command end", lgc.CommandName()) }()
 
 	var rollCmd struct {
 		RangeArg []string `arg:"" optional:"" help:"roll range, eg. 100 / 50-100 / opt1 opt2 opt3"`
 	}
-	_, output := lgc.parseCommandSyntax(&rollCmd, RollCommand)
+	_, output := lgc.parseCommandSyntax(&rollCmd, lgc.CommandName())
 	if output != "" {
 		lgc.textReply(output)
 	}
@@ -496,12 +505,12 @@ func (lgc *LspGroupCommand) RollCommand() {
 }
 
 func (lgc *LspGroupCommand) CheckinCommand() {
-	log := lgc.DefaultLoggerWithCommand(CheckinCommand)
-	log.Infof("run checkin command")
-	defer func() { log.Info("checkin command end") }()
+	log := lgc.DefaultLoggerWithCommand(lgc.CommandName())
+	log.Infof("run %v command", lgc.CommandName())
+	defer func() { log.Infof("%v command end", lgc.CommandName()) }()
 
 	var checkinCmd struct{}
-	_, output := lgc.parseCommandSyntax(&checkinCmd, CheckinCommand)
+	_, output := lgc.parseCommandSyntax(&checkinCmd, lgc.CommandName())
 	if output != "" {
 		lgc.textReply(output)
 	}
@@ -511,56 +520,54 @@ func (lgc *LspGroupCommand) CheckinCommand() {
 
 	date := time.Now().Format("20060102")
 
-	err := localdb.RWCoverTx(func(tx *buntdb.Tx) error {
-		var score int64
-		key := localdb.Key("Score", lgc.groupCode(), lgc.uin())
+	var score int64
+	var success bool
+	err := localdb.RWCover(func() error {
+		var err error
+		scoreKey := localdb.Key("Score", lgc.groupCode(), lgc.uin())
 		dateMarker := localdb.Key("ScoreDate", lgc.groupCode(), lgc.uin(), date)
 
-		val, err := tx.Get(key)
-		if err == buntdb.ErrNotFound {
-			score = 0
-		} else {
-			score, err = strconv.ParseInt(val, 10, 64)
-			if err != nil {
-				log.WithField("value", val).Errorf("parse score failed %v", err)
-				return err
-			}
+		score, err = localdb.GetInt64(scoreKey, localdb.IgnoreNotFoundOpt())
+		if err != nil {
+			return err
 		}
-		_, err = tx.Get(dateMarker)
-		if err != buntdb.ErrNotFound {
-			lgc.textReplyF("明天再来吧，当前积分为%v", score)
+		if localdb.Exist(dateMarker) {
+			log = log.WithField("current_score", score)
+			success = false
 			return nil
 		}
 
-		score += 1
-		_, _, err = tx.Set(key, strconv.FormatInt(score, 10), nil)
+		score, err = localdb.SeqNext(scoreKey)
 		if err != nil {
-			log.WithField("sender", lgc.uin()).Errorf("update score failed %v", err)
 			return err
 		}
 
-		_, _, err = tx.Set(dateMarker, "1", localdb.ExpireOption(time.Hour*24*3))
+		err = localdb.Set(dateMarker, "", localdb.SetExpireOpt(time.Hour*24*3))
 		if err != nil {
-			log.WithField("sender", lgc.uin()).Errorf("update score marker failed %v", err)
 			return err
 		}
-		log = log.WithField("new score", score)
-		lgc.textReplyF("签到成功！获得1积分，当前积分为%v", score)
+		log = log.WithField("new_score", score)
+		success = true
 		return nil
 	})
 	if err != nil {
 		lgc.textSend("失败 - 内部错误")
 		log.Errorf("checkin error %v", err)
+		return
 	}
+	lgc.sendChain(lgc.templateMsg("command.group.checkin.tmpl", map[string]interface{}{
+		"score":   score,
+		"success": success,
+	}))
 }
 
 func (lgc *LspGroupCommand) ScoreCommand() {
-	log := lgc.DefaultLoggerWithCommand(ScoreCommand)
-	log.Infof("run score command")
-	defer func() { log.Info("score command end") }()
+	log := lgc.DefaultLoggerWithCommand(lgc.CommandName())
+	log.Infof("run %v command", lgc.CommandName())
+	defer func() { log.Infof("%v command end", lgc.CommandName()) }()
 
 	var scoreCmd struct{}
-	_, output := lgc.parseCommandSyntax(&scoreCmd, ScoreCommand)
+	_, output := lgc.parseCommandSyntax(&scoreCmd, lgc.CommandName())
 	if output != "" {
 		lgc.textReply(output)
 	}
@@ -568,36 +575,31 @@ func (lgc *LspGroupCommand) ScoreCommand() {
 		return
 	}
 
-	var scoreS string
+	var score int64
 
-	localdb.RCoverTx(func(tx *buntdb.Tx) error {
+	err := localdb.RCover(func() error {
+		var err error
 		key := localdb.Key("Score", lgc.groupCode(), lgc.uin())
-		scoreS, _ = tx.Get(key)
-		return nil
+		score, err = localdb.GetInt64(key, localdb.IgnoreNotFoundOpt())
+		return err
 	})
-
-	if len(scoreS) == 0 {
-		scoreS = "0"
+	if err != nil {
+		lgc.textSend("失败 - 内部错误")
+	} else {
+		lgc.textReplyF("当前积分为%v", score)
 	}
-	score, _ := strconv.ParseInt(scoreS, 0, 64)
-	lgc.textReplyF("当前积分为%v", score)
 }
 
 func (lgc *LspGroupCommand) EnableCommand(disable bool) {
-	groupCode := lgc.groupCode()
-	log := lgc.DefaultLoggerWithCommand(EnableCommand).WithField("disable", disable)
-	log.Infof("run enable command")
-	defer func() { log.Info("enable command end") }()
 
-	name := "enable"
-	if disable {
-		name = "disable"
-	}
+	log := lgc.DefaultLoggerWithCommand(lgc.CommandName())
+	log.Infof("run %v command", lgc.CommandName())
+	defer func() { log.Infof("%v command end", lgc.CommandName()) }()
 
 	var enableCmd struct {
 		Command string `arg:"" optional:"" help:"command name"`
 	}
-	_, output := lgc.parseCommandSyntax(&enableCmd, name)
+	_, output := lgc.parseCommandSyntax(&enableCmd, lgc.CommandName())
 	if output != "" {
 		lgc.textReply(output)
 	}
@@ -607,21 +609,21 @@ func (lgc *LspGroupCommand) EnableCommand(disable bool) {
 
 	log = log.WithField("targetCommand", enableCmd.Command)
 
-	IEnable(lgc.NewMessageContext(log), groupCode, enableCmd.Command, disable)
+	IEnable(lgc.NewMessageContext(log), lgc.groupCode(), enableCmd.Command, disable)
 }
 
 func (lgc *LspGroupCommand) GrantCommand() {
-	log := lgc.DefaultLoggerWithCommand(GrantCommand)
-	log.Infof("run grant command")
-	defer func() { log.Info("grant command end") }()
+	log := lgc.DefaultLoggerWithCommand(lgc.CommandName())
+	log.Infof("run %v command", lgc.CommandName())
+	defer func() { log.Infof("%v command end", lgc.CommandName()) }()
 
 	var grantCmd struct {
-		Command string `optional:"" short:"c" xor:"1" help:"command name"`
-		Role    string `optional:"" short:"r" xor:"1" enum:"Admin,GroupAdmin," help:"Admin / GroupAdmin"`
-		Delete  bool   `short:"d" help:"perform a ungrant instead"`
-		Target  int64  `arg:""`
+		Command string `required:"" short:"c" xor:"1" help:"命令名"`
+		Role    string `required:"" short:"r" xor:"1" enum:"Admin,GroupAdmin" help:"Admin / GroupAdmin"`
+		Delete  bool   `short:"d" help:"删除模式，执行删除权限操作"`
+		Target  int64  `arg:"" help:"目标qq号"`
 	}
-	_, output := lgc.parseCommandSyntax(&grantCmd, GrantCommand)
+	_, output := lgc.parseCommandSyntax(&grantCmd, lgc.CommandName())
 	if output != "" {
 		lgc.textReply(output)
 	}
@@ -647,15 +649,15 @@ func (lgc *LspGroupCommand) GrantCommand() {
 }
 
 func (lgc *LspGroupCommand) SilenceCommand() {
-	log := lgc.DefaultLoggerWithCommand(SilenceCommand)
-	log.Info("run silence command")
-	defer func() { log.Info("silence command end") }()
+	log := lgc.DefaultLoggerWithCommand(lgc.CommandName())
+	log.Infof("run %v command", lgc.CommandName())
+	defer func() { log.Infof("%v command end", lgc.CommandName()) }()
 
 	var silenceCmd struct {
 		Delete bool `optional:"" short:"d" help:"取消设置"`
 	}
 
-	_, output := lgc.parseCommandSyntax(&silenceCmd, SilenceCommand, kong.Description("设置沉默模式"), kong.UsageOnError())
+	_, output := lgc.parseCommandSyntax(&silenceCmd, lgc.CommandName(), kong.Description("设置沉默模式"), kong.UsageOnError())
 	if output != "" {
 		lgc.textReply(output)
 	}
@@ -667,34 +669,34 @@ func (lgc *LspGroupCommand) SilenceCommand() {
 }
 
 func (lgc *LspGroupCommand) ConfigCommand() {
-	log := lgc.DefaultLoggerWithCommand(ConfigCommand)
-	log.Infof("run config command")
-	defer func() { log.Info("config command end") }()
+	log := lgc.DefaultLoggerWithCommand(lgc.CommandName())
+	log.Infof("run %v command", lgc.CommandName())
+	defer func() { log.Infof("%v command end", lgc.CommandName()) }()
 
 	var configCmd struct {
 		At struct {
-			Site   string  `optional:"" short:"s" default:"bilibili" help:"bilibili / douyu / youtube / huya"`
+			Site   string  `optional:"" short:"s" default:"bilibili" help:"网站参数"`
 			Id     string  `arg:"" help:"配置的主播id"`
 			Action string  `arg:"" enum:"add,remove,clear,show" help:"add / remove / clear / show"`
 			QQ     []int64 `arg:"" optional:"" help:"需要@的成员QQ号码"`
 		} `cmd:"" help:"配置推送时的@人员列表，默认为空" name:"at"`
 		AtAll struct {
-			Site   string `optional:"" short:"s" default:"bilibili" help:"bilibili / douyu / youtube / huya"`
+			Site   string `optional:"" short:"s" default:"bilibili" help:"网站参数"`
 			Id     string `arg:"" help:"配置的主播id"`
 			Switch string `arg:"" default:"on" enum:"on,off" help:"on / off"`
 		} `cmd:"" help:"配置推送时@全体成员，默认关闭，需要管理员权限" name:"at_all"`
 		TitleNotify struct {
-			Site   string `optional:"" short:"s" default:"bilibili" help:"bilibili / douyu / youtube / huya"`
+			Site   string `optional:"" short:"s" default:"bilibili" help:"网站参数"`
 			Id     string `arg:"" help:"配置的主播id"`
 			Switch string `arg:"" default:"off" enum:"on,off" help:"on / off"`
 		} `cmd:"" help:"配置直播间标题发生变化时是否进行推送，默认不推送" name:"title_notify"`
 		OfflineNotify struct {
-			Site   string `optional:"" short:"s" default:"bilibili" help:"bilibili / douyu / youtube / huya"`
+			Site   string `optional:"" short:"s" default:"bilibili" help:"网站参数"`
 			Id     string `arg:"" help:"配置的主播id"`
 			Switch string `arg:"" default:"off" enum:"on,off," help:"on / off"`
 		} `cmd:"" help:"配置下播时是否进行推送，默认不推送" name:"offline_notify"`
 		Filter struct {
-			Site string `optional:"" short:"s" default:"bilibili" help:"bilibili"`
+			Site string `optional:"" short:"s" default:"bilibili" help:"网站参数"`
 			Type struct {
 				Id   string   `arg:"" help:"配置的主播id"`
 				Type []string `arg:"" optional:"" help:"指定的种类"`
@@ -713,10 +715,12 @@ func (lgc *LspGroupCommand) ConfigCommand() {
 			Show struct {
 				Id string `arg:"" help:"配置的主播id"`
 			} `cmd:"" help:"查看当前过滤器" name:"show" group:"filter"`
-		} `cmd:"" help:"配置动态过滤器，目前只支持b站动态" name:"filter"`
+		} `cmd:"" help:"配置动态过滤器" name:"filter"`
 	}
 
-	kongCtx, output := lgc.parseCommandSyntax(&configCmd, ConfigCommand, kong.Description("管理BOT的配置，目前支持配置@成员、@全体成员、开启下播推送、开启标题推送"))
+	kongCtx, output := lgc.parseCommandSyntax(&configCmd, lgc.CommandName(),
+		kong.Description("管理BOT的配置，目前支持配置@成员、@全体成员、开启下播推送、开启标题推送、推送过滤"),
+	)
 	if output != "" {
 		lgc.textReply(output)
 	}
@@ -766,11 +770,6 @@ func (lgc *LspGroupCommand) ConfigCommand() {
 			lgc.textSend(fmt.Sprintf("失败 - %v", err.Error()))
 			return
 		}
-		if site == youtube.Site {
-			log.WithField("site", configCmd.OfflineNotify.Site).Errorf("not supported")
-			lgc.textSend(fmt.Sprintf("失败 - %v", "暂不支持YTB"))
-			return
-		}
 		var on = utils.Switch2Bool(configCmd.OfflineNotify.Switch)
 		log = log.WithField("site", site).WithField("id", configCmd.OfflineNotify.Id).WithField("on", on)
 		IConfigOfflineNotifyCmd(lgc.NewMessageContext(log), lgc.groupCode(), configCmd.OfflineNotify.Id, site, ctype, on)
@@ -802,55 +801,12 @@ func (lgc *LspGroupCommand) ConfigCommand() {
 	}
 }
 
-func (lgc *LspGroupCommand) FaceCommand() {
-	log := lgc.DefaultLoggerWithCommand(FaceCommand)
-	log.Infof("run face command")
-	defer func() { log.Info("face command end") }()
-
-	_, output := lgc.parseCommandSyntax(&struct{}{}, FaceCommand, kong.Description("电脑使用/face [图片] 或者 回复图片消息+/face触发"))
-	if output != "" {
-		lgc.textReply(output)
-	}
-	if lgc.exit {
-		return
-	}
-
-	for _, e := range lgc.msg.Elements {
-		if e.Type() == message.Image {
-			switch ie := e.(type) {
-			case *message.GroupImageElement:
-				lgc.faceDetect(ie.Url)
-			case *message.FriendImageElement:
-				lgc.faceDetect(ie.Url)
-			default:
-				log.Errorf("cast to ImageElement failed")
-				lgc.textReply("失败")
-				return
-			}
-		} else if e.Type() == message.Reply {
-			if re, ok := e.(*message.ReplyElement); ok {
-				urls := lgc.l.LspStateManager.GetMessageImageUrl(lgc.groupCode(), re.ReplySeq)
-				if len(urls) >= 1 {
-					lgc.faceDetect(urls[0])
-					return
-				}
-			} else {
-				log.Errorf("cast to ReplyElement failed")
-				lgc.textReply("失败")
-				return
-			}
-		}
-	}
-	log.Debug("no image found")
-	lgc.textReply("参数错误 - 未找到图片")
-}
-
 func (lgc *LspGroupCommand) ReverseCommand() {
-	log := lgc.DefaultLoggerWithCommand(ReverseCommand)
-	log.Info("run reverse command")
-	defer func() { log.Info("reverse command end") }()
+	log := lgc.DefaultLoggerWithCommand(lgc.CommandName())
+	log.Infof("run %v command", lgc.CommandName())
+	defer func() { log.Infof("%v command end", lgc.CommandName()) }()
 
-	_, output := lgc.parseCommandSyntax(&struct{}{}, ReverseCommand, kong.Description("电脑使用/倒放 [图片] 或者 回复图片消息+/倒放触发"))
+	_, output := lgc.parseCommandSyntax(&struct{}{}, lgc.CommandName(), kong.Description("电脑使用/倒放 [图片] 或者 回复图片消息+/倒放触发"))
 	if output != "" {
 		lgc.textReply(output)
 	}
@@ -888,11 +844,30 @@ func (lgc *LspGroupCommand) ReverseCommand() {
 }
 
 func (lgc *LspGroupCommand) HelpCommand() {
-	log := lgc.DefaultLoggerWithCommand(HelpCommand)
-	log.Info("run help command")
-	defer func() { log.Info("help command end") }()
+	log := lgc.DefaultLoggerWithCommand(lgc.CommandName())
+	log.Infof("run %v command", lgc.CommandName())
+	defer func() { log.Infof("%v command end", lgc.CommandName()) }()
 
-	_, output := lgc.parseCommandSyntax(&struct{}{}, HelpCommand, kong.Description("print help message"))
+	_, output := lgc.parseCommandSyntax(&struct{}{}, lgc.CommandName(), kong.Description("print help message"))
+	if output != "" {
+		lgc.textReply(output)
+	}
+	if lgc.exit {
+		return
+	}
+	lgc.sendChain(lgc.templateMsg("command.group.help.tmpl", nil))
+}
+
+func (lgc *LspGroupCommand) CleanConcernCommand() {
+	log := lgc.DefaultLoggerWithCommand(lgc.CommandName())
+	log.Infof("run %v command", lgc.CommandName())
+	defer func() { log.Infof("%v command end", lgc.CommandName()) }()
+
+	var cleanConcernCmd struct {
+		Site string `optional:"" short:"s" help:"清除指定的网站订阅,默认为全部"`
+		Type string `optional:"" short:"t" help:"清除指定的订阅类型,默认为全部"`
+	}
+	_, output := lgc.parseCommandSyntax(&cleanConcernCmd, lgc.CommandName(), kong.Description("print help message"))
 	if output != "" {
 		lgc.textReply(output)
 	}
@@ -900,18 +875,9 @@ func (lgc *LspGroupCommand) HelpCommand() {
 		return
 	}
 
-	var sb strings.Builder
-	sb.WriteString("DDBOT是一个多功能单推专用推送机器人，支持b站、斗鱼、油管、虎牙推送\n")
+	ICleanConcern(lgc.NewMessageContext(log),
+		false, []int64{lgc.groupCode()}, cleanConcernCmd.Site, cleanConcernCmd.Type)
 
-	switch lgc.l.LspStateManager.GetCurrentMode() {
-	case PublicMode:
-		sb.WriteString("当前BOT处于公开状态，添加BOT好友后即可让BOT为阁下的群服务\n详细介绍请添加好友后私聊发送/help")
-	case PrivateMode:
-		sb.WriteString("当前BOT处于私有状态，BOT会拒绝好友与加群邀请")
-	case ProtectMode:
-		sb.WriteString("当前BOT处于审核状态，添加BOT好友并由管理员审核后即可让BOT为阁下的群服务\n详细介绍请添加好友后私聊发送/help")
-	}
-	lgc.textReply(sb.String())
 }
 
 func (lgc *LspGroupCommand) DefaultLogger() *logrus.Entry {
@@ -924,40 +890,10 @@ func (lgc *LspGroupCommand) DefaultLoggerWithCommand(command string) *logrus.Ent
 	return lgc.DefaultLogger().WithField("Command", command)
 }
 
-func (lgc *LspGroupCommand) faceDetect(url string) {
-	log := lgc.DefaultLoggerWithCommand(FaceCommand)
-	log.WithField("detect_url", url).Debug("face detect")
-	img, err := utils.ImageGet(url, proxy_pool.PreferMainland)
-	if err != nil {
-		log.Errorf("get image err %v", err)
-		lgc.textReply("获取图片失败")
-		return
-	}
-	img, err = utils.OpenCvAnimeFaceDetect(img)
-	if err == utils.ErrGoCvNotSetUp {
-		log.Debug("gocv not setup")
-		return
-	}
-	if err != nil {
-		log.Errorf("detect image err %v", err)
-		lgc.textReply(fmt.Sprintf("检测失败 - %v", err))
-		return
-	}
-	sendingMsg := message.NewSendingMessage()
-	groupImg, err := lgc.bot.UploadGroupImage(lgc.groupCode(), bytes.NewReader(img))
-	if err != nil {
-		log.Errorf("upload group image failed %v", err)
-		lgc.textReply("上传失败")
-		return
-	}
-	sendingMsg.Append(groupImg)
-	lgc.reply(sendingMsg)
-}
-
 func (lgc *LspGroupCommand) reserveGif(url string) {
-	log := lgc.DefaultLoggerWithCommand(ReverseCommand)
+	log := lgc.DefaultLoggerWithCommand(lgc.CommandName())
 	log.WithField("reserve_url", url).Debug("reserve image")
-	img, err := utils.ImageGet(url, proxy_pool.PreferNone)
+	img, err := utils.ImageGet(url)
 	if err != nil {
 		log.Errorf("get image err %v", err)
 		lgc.textReply("获取图片失败")
@@ -969,15 +905,7 @@ func (lgc *LspGroupCommand) reserveGif(url string) {
 		lgc.textReply(fmt.Sprintf("失败 - %v", err))
 		return
 	}
-	sendingMsg := message.NewSendingMessage()
-	groupImage, err := lgc.bot.UploadGroupImage(lgc.groupCode(), bytes.NewReader(img))
-	if err != nil {
-		log.Errorf("upload group image failed %v", err)
-		lgc.textReply("上传失败")
-		return
-	}
-	sendingMsg.Append(groupImage)
-	lgc.reply(sendingMsg)
+	lgc.reply(mmsg.NewMSG().Image(img, ""))
 }
 
 func (lgc *LspGroupCommand) uin() int64 {
@@ -1041,58 +969,38 @@ func (lgc *LspGroupCommand) groupDisabled(command string) bool {
 }
 
 func (lgc *LspGroupCommand) textReply(text string) *message.GroupMessage {
-	sendingMsg := message.NewSendingMessage()
-	sendingMsg.Append(message.NewText(text))
-	return lgc.reply(sendingMsg)
+	return lgc.reply(mmsg.NewText(text))
 }
 
 func (lgc *LspGroupCommand) textReplyF(format string, args ...interface{}) *message.GroupMessage {
-	sendingMsg := message.NewSendingMessage()
-	sendingMsg.Append(utils.MessageTextf(format, args...))
-	return lgc.reply(sendingMsg)
+	return lgc.reply(mmsg.NewTextf(format, args...))
 }
 
 func (lgc *LspGroupCommand) textSend(text string) *message.GroupMessage {
-	sendingMsg := message.NewSendingMessage()
-	sendingMsg.Append(message.NewText(text))
-	return lgc.send(sendingMsg)
+	return lgc.send(mmsg.NewText(text))
 }
 
 func (lgc *LspGroupCommand) textSendF(format string, args ...interface{}) *message.GroupMessage {
-	sendingMsg := message.NewSendingMessage()
-	sendingMsg.Append(utils.MessageTextf(format, args...))
-	return lgc.send(sendingMsg)
+	return lgc.send(mmsg.NewTextf(format, args...))
 }
 
-func (lgc *LspGroupCommand) reply(msg *message.SendingMessage) *message.GroupMessage {
-	sendingMsg := message.NewSendingMessage()
-	sendingMsg.Append(message.NewReply(lgc.msg))
-	for _, e := range msg.Elements {
-		sendingMsg.Append(e)
-	}
-	return lgc.send(sendingMsg)
+func (lgc *LspGroupCommand) reply(msg *mmsg.MSG) *message.GroupMessage {
+	m := mmsg.NewMSG()
+	m.Append(message.NewReply(lgc.msg))
+	m.Append(msg.Elements()...)
+	return lgc.send(m)
 }
 
-func (lgc *LspGroupCommand) send(msg *message.SendingMessage) *message.GroupMessage {
-	return lgc.l.sendGroupMessage(lgc.groupCode(), msg)
+func (lgc *LspGroupCommand) send(msg *mmsg.MSG) *message.GroupMessage {
+	return lgc.l.GM(lgc.l.SendMsg(msg, mmsg.NewGroupTarget(lgc.groupCode())))[0]
+}
+
+func (lgc *LspGroupCommand) sendChain(msg *mmsg.MSG) []*message.GroupMessage {
+	return lgc.l.GM(lgc.l.SendMsg(msg, mmsg.NewGroupTarget(lgc.groupCode())))
 }
 
 func (lgc *LspGroupCommand) sender() *message.Sender {
 	return lgc.msg.Sender
-}
-
-func (lgc *LspGroupCommand) privateSend(msg *message.SendingMessage) {
-	if lgc.msg.Sender.IsFriend {
-		lgc.bot.SendPrivateMessage(lgc.uin(), msg)
-	} else {
-		lgc.bot.SendGroupTempMessage(lgc.groupCode(), lgc.uin(), msg)
-	}
-}
-
-func (lgc *LspGroupCommand) privateTextSend(text string) {
-	sendingMsg := message.NewSendingMessage()
-	sendingMsg.Append(message.NewText(text))
-	lgc.privateSend(sendingMsg)
 }
 
 func (lgc *LspGroupCommand) noPermissionReply() *message.GroupMessage {
@@ -1103,21 +1011,44 @@ func (lgc *LspGroupCommand) globalDisabledReply() *message.GroupMessage {
 	return lgc.textReply("无法操作该命令，该命令已被管理员禁用")
 }
 
+func (lgc *LspGroupCommand) commonTemplateData() map[string]interface{} {
+	return map[string]interface{}{
+		"msg":         lgc.msg,
+		"group_code":  lgc.groupCode(),
+		"group_name":  lgc.groupName(),
+		"member_code": lgc.sender().Uin,
+		"member_name": lgc.sender().DisplayName(),
+		"command":     CommandMaps,
+	}
+}
+
+func (lgc *LspGroupCommand) templateMsg(name string, data map[string]interface{}) *mmsg.MSG {
+	commonData := lgc.commonTemplateData()
+	for k, v := range data {
+		commonData[k] = v
+	}
+	commonData["template_name"] = name
+	m, err := template.LoadAndExec(name, commonData)
+	if err != nil {
+		logger.Errorf("LoadAndExec error %v", err)
+		lgc.textReply(fmt.Sprintf("错误 - %v", err))
+		return nil
+	}
+	return m
+}
+
 func (lgc *LspGroupCommand) NewMessageContext(log *logrus.Entry) *MessageContext {
 	ctx := NewMessageContext()
-	ctx.Source = SourceTypeGroup
+	ctx.Target = mmsg.NewGroupTarget(lgc.groupCode())
 	ctx.Lsp = lgc.l
 	ctx.Log = log
-	ctx.TextReply = func(text string) interface{} {
-		return lgc.textReply(text)
+	ctx.SendFunc = func(m *mmsg.MSG) interface{} {
+		return lgc.send(m)
 	}
-	ctx.Send = func(msg *message.SendingMessage) interface{} {
-		return lgc.send(msg)
+	ctx.ReplyFunc = func(m *mmsg.MSG) interface{} {
+		return lgc.reply(m)
 	}
-	ctx.Reply = func(sendingMessage *message.SendingMessage) interface{} {
-		return lgc.reply(sendingMessage)
-	}
-	ctx.NoPermissionReply = func() interface{} {
+	ctx.NoPermissionReplyFunc = func() interface{} {
 		ctx.Log.Debugf("no permission")
 		if !lgc.l.PermissionStateManager.CheckGroupSilence(lgc.groupCode()) {
 			return lgc.noPermissionReply()

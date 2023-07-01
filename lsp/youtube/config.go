@@ -1,43 +1,23 @@
 package youtube
 
 import (
-	"github.com/Sora233/DDBOT/concern"
-	"github.com/Sora233/DDBOT/lsp/concern_manager"
+	"github.com/Sora233/DDBOT/lsp/concern"
 )
 
 type GroupConcernConfig struct {
-	concern_manager.GroupConcernConfig
+	concern.IConfig
 }
 
-func (g *GroupConcernConfig) AtBeforeHook(notify concern.Notify) (hook *concern_manager.HookResult) {
-	hook = new(concern_manager.HookResult)
-	switch notify.Type() {
-	case concern.YoutubeLive:
-		e := notify.(*ConcernNotify)
-		if !e.IsLiving() {
-			hook.Reason = "IsLiving() is false"
-			return
-		} else {
-			hook.PassOrReason(e.LiveStatusChanged, "LiveStatusChanged is false")
-			return
+func (g *GroupConcernConfig) ShouldSendHook(notify concern.Notify) *concern.HookResult {
+	if c, ok := notify.(*ConcernNotify); ok {
+		// 直播预告也应该推送
+		if c.IsWaiting() {
+			return concern.HookResultPass
 		}
-	case concern.YoutubeVideo:
-		hook.Pass = true
-		return
 	}
-	return g.GroupConcernConfig.AtBeforeHook(notify)
+	return g.IConfig.ShouldSendHook(notify)
 }
 
-func (g *GroupConcernConfig) ShouldSendHook(notify concern.Notify) (hook *concern_manager.HookResult) {
-	hook = new(concern_manager.HookResult)
-	switch notify.(type) {
-	case *ConcernNotify:
-		hook.Pass = true
-		return
-	}
-	return g.GroupConcernConfig.ShouldSendHook(notify)
-}
-
-func NewGroupConcernConfig(g *concern_manager.GroupConcernConfig) *GroupConcernConfig {
-	return &GroupConcernConfig{*g}
+func NewGroupConcernConfig(g concern.IConfig) *GroupConcernConfig {
+	return &GroupConcernConfig{g}
 }

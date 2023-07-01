@@ -4,14 +4,17 @@ import (
 	"github.com/Mrs4s/MiraiGo/client"
 	"github.com/Mrs4s/MiraiGo/message"
 	localutils "github.com/Sora233/DDBOT/utils"
+	"github.com/Sora233/DDBOT/utils/msgstringer"
+	"github.com/Sora233/MiraiGo-Template/config"
 	rotatelogs "github.com/lestrrat-go/file-rotatelogs"
 	"github.com/rifflock/lfshook"
 	"github.com/sirupsen/logrus"
+	"io"
 	"path"
 	"sync"
 	"time"
 
-	"github.com/Logiase/MiraiGo-Template/bot"
+	"github.com/Sora233/MiraiGo-Template/bot"
 )
 
 const moduleId = "ddbot.logging"
@@ -47,6 +50,9 @@ func (m *logging) Init() {
 		return
 	}
 	qqlog := logrus.New()
+	if !config.GlobalConfig.GetBool("qq-logs.enabled") && !config.GlobalConfig.GetBool("qq-logs.enable") {
+		qqlog.Out = io.Discard
+	}
 	qqlog.AddHook(lfshook.NewHook(writer, &logrus.TextFormatter{
 		FullTimestamp:    true,
 		PadLevelText:     true,
@@ -95,7 +101,7 @@ func logGroupMessage(msg *message.GroupMessage) {
 			"MessageIID": msg.InternalId,
 			"SenderID":   msg.Sender.Uin,
 			"SenderName": msg.Sender.DisplayName(),
-		}).Info(localutils.MsgToString(msg.Elements))
+		}).Info(msgstringer.MsgToString(msg.Elements))
 }
 
 func logPrivateMessage(msg *message.PrivateMessage) {
@@ -106,7 +112,7 @@ func logPrivateMessage(msg *message.PrivateMessage) {
 		"SenderID":   msg.Sender.Uin,
 		"SenderName": msg.Sender.DisplayName(),
 		"Target":     msg.Target,
-	}).Info(localutils.MsgToString(msg.Elements))
+	}).Info(msgstringer.MsgToString(msg.Elements))
 }
 
 func logFriendMessageRecallEvent(event *client.FriendMessageRecalledEvent) {
@@ -169,35 +175,35 @@ func logDisconnect(event *client.ClientDisconnectedEvent) {
 }
 
 func registerLog(b *bot.Bot) {
-	b.OnGroupMessageRecalled(func(qqClient *client.QQClient, event *client.GroupMessageRecalledEvent) {
+	b.GroupMessageRecalledEvent.Subscribe(func(qqClient *client.QQClient, event *client.GroupMessageRecalledEvent) {
 		logGroupMessageRecallEvent(event)
 	})
 
-	b.OnGroupMessage(func(qqClient *client.QQClient, groupMessage *message.GroupMessage) {
+	b.GroupMessageEvent.Subscribe(func(qqClient *client.QQClient, groupMessage *message.GroupMessage) {
 		logGroupMessage(groupMessage)
 	})
 
-	b.OnGroupMuted(func(qqClient *client.QQClient, event *client.GroupMuteEvent) {
+	b.GroupMuteEvent.Subscribe(func(qqClient *client.QQClient, event *client.GroupMuteEvent) {
 		logGroupMuteEvent(event)
 	})
 
-	b.OnPrivateMessage(func(qqClient *client.QQClient, privateMessage *message.PrivateMessage) {
+	b.PrivateMessageEvent.Subscribe(func(qqClient *client.QQClient, privateMessage *message.PrivateMessage) {
 		logPrivateMessage(privateMessage)
 	})
 
-	b.OnFriendMessageRecalled(func(qqClient *client.QQClient, event *client.FriendMessageRecalledEvent) {
+	b.FriendMessageRecalledEvent.Subscribe(func(qqClient *client.QQClient, event *client.FriendMessageRecalledEvent) {
 		logFriendMessageRecallEvent(event)
 	})
 
-	b.OnDisconnected(func(qqClient *client.QQClient, event *client.ClientDisconnectedEvent) {
+	b.DisconnectedEvent.Subscribe(func(qqClient *client.QQClient, event *client.ClientDisconnectedEvent) {
 		logDisconnect(event)
 	})
 
-	b.OnSelfGroupMessage(func(qqClient *client.QQClient, groupMessage *message.GroupMessage) {
+	b.SelfGroupMessageEvent.Subscribe(func(qqClient *client.QQClient, groupMessage *message.GroupMessage) {
 		logGroupMessage(groupMessage)
 	})
 
-	b.OnSelfPrivateMessage(func(qqClient *client.QQClient, privateMessage *message.PrivateMessage) {
+	b.SelfPrivateMessageEvent.Subscribe(func(qqClient *client.QQClient, privateMessage *message.PrivateMessage) {
 		logPrivateMessage(privateMessage)
 	})
 }

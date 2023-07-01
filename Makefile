@@ -1,26 +1,24 @@
 BUILD_TIME := $(shell date --rfc-3339=seconds)
 COMMIT_ID := $(shell git rev-parse HEAD)
 
-LDFLAGS = -X "main.BuildTime='"$(BUILD_TIME)"'" -X "main.CommitId='"$(COMMIT_ID)"'"
+LDFLAGS = -X "github.com/Sora233/DDBOT/lsp.BuildTime='"$(BUILD_TIME)"'" -X "github.com/Sora233/DDBOT/lsp.CommitId='"$(COMMIT_ID)"'"
 
-SRC := $(shell find . -type f -name '*.go')
+SRC := $(shell find . -type f -name '*.go') lsp/template/default/*
+PROTO := $(shell find . -type f -name '*.proto')
 COV := .coverage.out
 TARGET := DDBOT
 
 $(COV): $(SRC)
-	go test ./... -tags=nocv -coverprofile=$(COV)
+	go test ./... -coverprofile=$(COV)
 
 
 $(TARGET): $(SRC) go.mod go.sum
-ifdef NOCV
-	echo 'build without opencv'
-	go build -tags nocv -ldflags '$(LDFLAGS)' -o $(TARGET)
-else
-	echo 'build with opencv'
-	go build -ldflags '$(LDFLAGS)' -o $(TARGET)
-endif
+	go build -ldflags '$(LDFLAGS)' -o $(TARGET) github.com/Sora233/DDBOT/cmd
 
 build: $(TARGET)
+
+proto: $(PROTO)
+	protoc --go_out=. $(PROTO)
 
 test: $(COV)
 

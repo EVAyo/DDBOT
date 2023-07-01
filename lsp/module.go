@@ -2,59 +2,65 @@ package lsp
 
 import (
 	"fmt"
-	"github.com/Logiase/MiraiGo-Template/bot"
-	"github.com/Logiase/MiraiGo-Template/config"
-	"github.com/Logiase/MiraiGo-Template/utils"
 	"github.com/Mrs4s/MiraiGo/client"
 	"github.com/Mrs4s/MiraiGo/message"
-	"github.com/Sora233/DDBOT/concern"
 	"github.com/Sora233/DDBOT/image_pool"
 	"github.com/Sora233/DDBOT/image_pool/local_pool"
 	"github.com/Sora233/DDBOT/image_pool/lolicon_pool"
-	"github.com/Sora233/DDBOT/lsp/bilibili"
 	localdb "github.com/Sora233/DDBOT/lsp/buntdb"
-	"github.com/Sora233/DDBOT/lsp/concern_manager"
-	"github.com/Sora233/DDBOT/lsp/douyu"
-	"github.com/Sora233/DDBOT/lsp/huya"
+	"github.com/Sora233/DDBOT/lsp/cfg"
+	"github.com/Sora233/DDBOT/lsp/concern"
+	"github.com/Sora233/DDBOT/lsp/concern_type"
+	"github.com/Sora233/DDBOT/lsp/mmsg"
 	"github.com/Sora233/DDBOT/lsp/permission"
+	"github.com/Sora233/DDBOT/lsp/template"
 	"github.com/Sora233/DDBOT/lsp/version"
-	"github.com/Sora233/DDBOT/lsp/youtube"
 	"github.com/Sora233/DDBOT/proxy_pool"
 	"github.com/Sora233/DDBOT/proxy_pool/local_proxy_pool"
 	"github.com/Sora233/DDBOT/proxy_pool/py"
-	"github.com/Sora233/DDBOT/proxy_pool/zhima"
 	localutils "github.com/Sora233/DDBOT/utils"
-	zhimaproxypool "github.com/Sora233/zhima-proxy-pool"
+	"github.com/Sora233/DDBOT/utils/msgstringer"
+	"github.com/Sora233/MiraiGo-Template/bot"
+	"github.com/Sora233/MiraiGo-Template/config"
+	"github.com/fsnotify/fsnotify"
+	jsoniter "github.com/json-iterator/go"
+	"github.com/robfig/cron/v3"
 	"github.com/sirupsen/logrus"
-	"runtime"
+	"github.com/tidwall/buntdb"
+	"go.uber.org/atomic"
+	"golang.org/x/sync/semaphore"
+	"os"
+	"reflect"
 	"runtime/debug"
-	"strings"
 	"sync"
 	"time"
 )
 
 const ModuleName = "me.sora233.Lsp"
 
-var logger = utils.GetModuleLogger(ModuleName)
+var logger = logrus.WithField("module", ModuleName)
+
+var json = jsoniter.ConfigCompatibleWithStandardLibrary
 
 var Debug = false
 
 type Lsp struct {
-	bilibiliConcern *bilibili.Concern
-	// 辣鸡语言毁我青春
-	douyuConcern   *douyu.Concern
-	youtubeConcern *youtube.Concern
-	huyaConcern    *huya.Concern
-	pool           image_pool.Pool
-	concernNotify  chan concern.Notify
-	stop           chan interface{}
-	wg             sync.WaitGroup
-	status         *Status
-	notifyWg       sync.WaitGroup
+	pool          image_pool.Pool
+	concernNotify <-chan concern.Notify
+	stop          chan interface{}
+	wg            sync.WaitGroup
+	status        *Status
+	notifyWg      sync.WaitGroup
+	msgLimit      *semaphore.Weighted
+	cron          *cron.Cron
 
 	PermissionStateManager *permission.StateManager
 	LspStateManager        *StateManager
-	started                bool
+	started                atomic.Bool
+}
+
+func (l *Lsp) CommandShowName(command string) string {
+	return cfg.GetCommandPrefix(command) + command
 }
 
 func (l *Lsp) MiraiGoModule() bot.ModuleInfo {
@@ -74,27 +80,62 @@ func (l *Lsp) Init() {
 		logrus.SetLevel(lev)
 		log.Infof("设置logLevel为%v", lev.String())
 	}
-	if err := localdb.InitBuntDB(""); err != nil {
-		log.Fatalf("无法正常初始化数据库！请检查.lsp.db文件权限是否正确，如无问题则为数据库文件损坏，请阅读文档获得帮助。")
+
+	l.msgLimit = semaphore.NewWeighted(int64(cfg.GetNotifyParallel()))
+
+	if Tags != "UNKNOWN" {
+		logger.Infof("DDBOT版本：Release版本【%v】", Tags)
+	} else {
+		if CommitId == "UNKNOWN" {
+			logger.Infof("DDBOT版本：编译版本未知")
+		} else {
+			logger.Infof("DDBOT版本：编译版本【%v-%v】", BuildTime, CommitId)
+		}
 	}
 
-	curVersion := version.GetCurrentVersion(LspVersionName)
-
-	if curVersion == -1 {
-		log.Errorf("警告：无法检查数据库兼容性，程序可能无法正常工作")
-	} else if curVersion > LspSupportVersion {
-		log.Fatalf("警告：检查数据库兼容性失败！最高支持版本：%v，当前版本：%v", LspSupportVersion, curVersion)
+	db := localdb.MustGetClient()
+	var count int
+	err = db.View(func(tx *buntdb.Tx) error {
+		return tx.Ascend("", func(key, value string) bool {
+			count++
+			return true
+		})
+	})
+	if err == nil && count == 0 {
+		if _, err := version.SetVersion(LspVersionName, LspSupportVersion); err != nil {
+			log.Fatalf("警告：初始化LspVersion失败！")
+		}
+	} else {
+		curVersion := version.GetCurrentVersion(LspVersionName)
+		if curVersion < 0 {
+			log.Errorf("警告：无法检查数据库兼容性，程序可能无法正常工作")
+		} else if curVersion > LspSupportVersion {
+			log.Fatalf("警告：检查数据库兼容性失败！最高支持版本：%v，当前版本：%v", LspSupportVersion, curVersion)
+		} else if curVersion < LspSupportVersion {
+			// 应该更新下
+			backupFileName := fmt.Sprintf("%v-%v", localdb.LSPDB, time.Now().Unix())
+			log.Warnf(
+				`警告：数据库兼容性检查完毕，当前需要从<%v>更新至<%v>，将备份当前数据库文件到"%v"`,
+				curVersion, LspSupportVersion, backupFileName)
+			f, err := os.Create(backupFileName)
+			if err != nil {
+				log.Fatalf(`无法创建备份文件<%v>：%v`, backupFileName, err)
+			}
+			err = db.Save(f)
+			if err != nil {
+				log.Fatalf(`无法备份数据库到<%v>：%v`, backupFileName, err)
+			}
+			log.Infof(`备份完成，已备份数据库到<%v>"`, backupFileName)
+			log.Info("五秒后将开始更新数据库，如需取消请按Ctrl+C")
+			time.Sleep(time.Second * 5)
+			err = version.DoMigration(LspVersionName, lspMigrationMap)
+			if err != nil {
+				log.Fatalf("更新数据库失败：%v", err)
+			}
+		} else {
+			log.Debugf("数据库兼容性检查完毕，当前已为最新模式：%v", curVersion)
+		}
 	}
-
-	bilibili.Init()
-
-	l.PermissionStateManager = permission.NewStateManager()
-	l.LspStateManager = NewStateManager()
-
-	l.bilibiliConcern = bilibili.NewConcern(l.concernNotify)
-	l.douyuConcern = douyu.NewConcern(l.concernNotify)
-	l.youtubeConcern = youtube.NewConcern(l.concernNotify)
-	l.huyaConcern = huya.NewConcern(l.concernNotify)
 
 	imagePoolType := config.GlobalConfig.GetString("imagePool.type")
 	log = logger.WithField("image_pool_type", imagePoolType)
@@ -141,19 +182,6 @@ func (l *Lsp) Init() {
 			proxy_pool.Init(pyPool)
 			l.status.ProxyPoolEnable = true
 		}
-	case "zhimaProxyPool":
-		api := config.GlobalConfig.GetString("zhimaProxyPool.api")
-		log.WithField("api", api).Debug("debug")
-		cfg := &zhimaproxypool.Config{
-			ApiAddr:   api,
-			BackUpCap: config.GlobalConfig.GetInt("zhimaProxyPool.BackUpCap"),
-			ActiveCap: config.GlobalConfig.GetInt("zhimaProxyPool.ActiveCap"),
-			ClearTime: time.Second * time.Duration(config.GlobalConfig.GetInt("zhimaProxyPool.ClearTime")),
-			TimeLimit: time.Minute * time.Duration(config.GlobalConfig.GetInt("zhimaProxyPool.TimeLimit")),
-		}
-		zhimaPool := zhimaproxypool.NewZhimaProxyPool(cfg, zhima.NewBuntdbPersister())
-		proxy_pool.Init(zhima.NewZhimaWrapper(zhimaPool, 15))
-		l.status.ProxyPoolEnable = true
 	case "localProxyPool":
 		overseaProxies := config.GlobalConfig.GetStringSlice("localProxyPool.oversea")
 		mainlandProxies := config.GlobalConfig.GetStringSlice("localProxyPool.mainland")
@@ -179,13 +207,52 @@ func (l *Lsp) Init() {
 	default:
 		log.Errorf("unknown proxy type")
 	}
+	if cfg.GetTemplateEnabled() {
+		log.Infof("已启用模板")
+		template.InitTemplateLoader()
+	}
+	cfg.ReloadCustomCommandPrefix()
+	config.GlobalConfig.OnConfigChange(func(in fsnotify.Event) {
+		go cfg.ReloadCustomCommandPrefix()
+		l.CronjobReload()
+	})
 }
 
 func (l *Lsp) PostInit() {
 }
 
 func (l *Lsp) Serve(bot *bot.Bot) {
-	bot.OnGroupInvited(func(qqClient *client.QQClient, request *client.GroupInvitedRequest) {
+	bot.GroupMemberJoinEvent.Subscribe(func(qqClient *client.QQClient, event *client.MemberJoinGroupEvent) {
+		if err := localdb.Set(localdb.Key("OnGroupMemberJoined", event.Group.Code, event.Member.Uin, event.Member.JoinTime), "",
+			localdb.SetExpireOpt(time.Minute*2), localdb.SetNoOverWriteOpt()); err != nil {
+			return
+		}
+		m, _ := template.LoadAndExec("trigger.group.member_in.tmpl", map[string]interface{}{
+			"group_code":  event.Group.Code,
+			"group_name":  event.Group.Name,
+			"member_code": event.Member.Uin,
+			"member_name": event.Member.DisplayName(),
+		})
+		if m != nil {
+			l.SendMsg(m, mmsg.NewGroupTarget(event.Group.Code))
+		}
+	})
+	bot.GroupMemberLeaveEvent.Subscribe(func(qqClient *client.QQClient, event *client.MemberLeaveGroupEvent) {
+		if err := localdb.Set(localdb.Key("OnGroupMemberLeaved", event.Group.Code, event.Member.Uin, event.Member.JoinTime), "",
+			localdb.SetExpireOpt(time.Minute*2), localdb.SetNoOverWriteOpt()); err != nil {
+			return
+		}
+		m, _ := template.LoadAndExec("trigger.group.member_out.tmpl", map[string]interface{}{
+			"group_code":  event.Group.Code,
+			"group_name":  event.Group.Name,
+			"member_code": event.Member.Uin,
+			"member_name": event.Member.DisplayName(),
+		})
+		if m != nil {
+			l.SendMsg(m, mmsg.NewGroupTarget(event.Group.Code))
+		}
+	})
+	bot.GroupInvitedEvent.Subscribe(func(qqClient *client.QQClient, request *client.GroupInvitedRequest) {
 		log := logger.WithFields(logrus.Fields{
 			"GroupCode":   request.GroupCode,
 			"GroupName":   request.GroupName,
@@ -195,20 +262,30 @@ func (l *Lsp) Serve(bot *bot.Bot) {
 
 		if l.PermissionStateManager.CheckBlockList(request.InvitorUin) {
 			log.Debug("收到加群邀请，该用户在block列表中，将拒绝加群邀请")
+			l.PermissionStateManager.AddBlockList(request.GroupCode, 0)
 			request.Reject(false, "")
 			return
 		}
 
 		fi := bot.FindFriend(request.InvitorUin)
 		if fi == nil {
+			log.Error("收到加群邀请，无法找到好友信息，将拒绝加群邀请")
+			l.PermissionStateManager.AddBlockList(request.GroupCode, 0)
 			request.Reject(false, "未找到阁下的好友信息，请添加好友进行操作")
-			log.Errorf("收到加群邀请，无法找到好友信息，将拒绝加群邀请")
+			return
+		}
+
+		if l.PermissionStateManager.CheckAdmin(request.InvitorUin) {
+			log.Info("收到管理员的加群邀请，将同意加群邀请")
+			l.PermissionStateManager.DeleteBlockList(request.GroupCode)
+			request.Accept()
 			return
 		}
 
 		switch l.LspStateManager.GetCurrentMode() {
 		case PrivateMode:
 			log.Info("收到加群邀请，当前BOT处于私有模式，将拒绝加群邀请")
+			l.PermissionStateManager.AddBlockList(request.GroupCode, 0)
 			request.Reject(false, "当前BOT处于私有模式")
 		case ProtectMode:
 			if err := l.LspStateManager.SaveGroupInvitedRequest(request); err != nil {
@@ -219,12 +296,22 @@ func (l *Lsp) Serve(bot *bot.Bot) {
 			}
 		case PublicMode:
 			request.Accept()
+			l.PermissionStateManager.DeleteBlockList(request.GroupCode)
 			log.Info("收到加群邀请，当前BOT处于公开模式，将接受加群邀请")
-			sendingMsg := message.NewSendingMessage()
-			sendingMsg.Append(message.NewText(fmt.Sprintf("阁下的群邀请已通过，基于对阁下的信任，阁下已获得本bot在群【%s】的控制权限，相信阁下不会滥用本bot。", request.GroupName)))
-			bot.SendPrivateMessage(request.InvitorUin, sendingMsg)
+			m, _ := template.LoadAndExec("trigger.private.group_invited.tmpl", map[string]interface{}{
+				"member_code": request.InvitorUin,
+				"member_name": request.InvitorNick,
+				"group_code":  request.GroupCode,
+				"group_name":  request.GroupName,
+				"command":     CommandMaps,
+			})
+			if m != nil {
+				l.SendMsg(m, mmsg.NewPrivateTarget(request.InvitorUin))
+			}
 			if err := l.PermissionStateManager.GrantGroupRole(request.GroupCode, request.InvitorUin, permission.GroupAdmin); err != nil {
-				log.Errorf("设置群管理员权限失败 - %v", err)
+				if err != permission.ErrPermissionExist {
+					log.Errorf("设置群管理员权限失败 - %v", err)
+				}
 			}
 		default:
 			// impossible
@@ -233,7 +320,7 @@ func (l *Lsp) Serve(bot *bot.Bot) {
 		}
 	})
 
-	bot.OnNewFriendRequest(func(qqClient *client.QQClient, request *client.NewFriendRequest) {
+	bot.NewFriendRequestEvent.Subscribe(func(qqClient *client.QQClient, request *client.NewFriendRequest) {
 		log := logger.WithFields(logrus.Fields{
 			"RequesterUin":  request.RequesterUin,
 			"RequesterNick": request.RequesterNick,
@@ -265,7 +352,7 @@ func (l *Lsp) Serve(bot *bot.Bot) {
 		}
 	})
 
-	bot.OnNewFriendAdded(func(qqClient *client.QQClient, event *client.NewFriendEvent) {
+	bot.NewFriendEvent.Subscribe(func(qqClient *client.QQClient, event *client.NewFriendEvent) {
 		log := logger.WithFields(logrus.Fields{
 			"Uin":      event.Friend.Uin,
 			"Nickname": event.Friend.Nickname,
@@ -286,19 +373,23 @@ func (l *Lsp) Serve(bot *bot.Bot) {
 			return nil
 		})
 
-		sendingMsg := message.NewSendingMessage()
-		sendingMsg.Append(message.NewText("阁下的好友请求已通过，请使用/help查看帮助，然后在群成员页面邀请bot加群（bot不会主动加群）。"))
-		bot.SendPrivateMessage(event.Friend.Uin, sendingMsg)
+		m, _ := template.LoadAndExec("trigger.private.new_friend_added.tmpl", map[string]interface{}{
+			"member_code": event.Friend.Uin,
+			"member_name": event.Friend.Nickname,
+			"command":     CommandMaps,
+		})
+		if m != nil {
+			l.SendMsg(m, mmsg.NewPrivateTarget(event.Friend.Uin))
+		}
 	})
 
-	bot.OnJoinGroup(func(qqClient *client.QQClient, info *client.GroupInfo) {
+	bot.GroupJoinEvent.Subscribe(func(qqClient *client.QQClient, info *client.GroupInfo) {
 		l.FreshIndex()
 		log := logger.WithFields(logrus.Fields{
 			"GroupCode":   info.Code,
 			"MemberCount": info.MemberCount,
 			"GroupName":   info.Name,
 			"OwnerUin":    info.OwnerUin,
-			"Memo":        info.Memo,
 		})
 		log.Info("进入新群聊")
 
@@ -321,26 +412,35 @@ func (l *Lsp) Serve(bot *bot.Bot) {
 			}
 			for _, req := range requests {
 				if req.GroupCode == info.Code {
-					l.LspStateManager.DeleteGroupInvitedRequest(req.RequestId)
-					l.PermissionStateManager.GrantGroupRole(info.Code, req.InvitorUin, permission.GroupAdmin)
+					if err = l.LspStateManager.DeleteGroupInvitedRequest(req.RequestId); err != nil {
+						log.WithField("RequestId", req.RequestId).Errorf("DeleteGroupInvitedRequest error %v", err)
+					}
+					if err = l.PermissionStateManager.GrantGroupRole(info.Code, req.InvitorUin, permission.GroupAdmin); err != nil {
+						if err != permission.ErrPermissionExist {
+							log.WithField("target", req.InvitorUin).Errorf("设置群管理员权限失败 - %v", err)
+						}
+					}
 				}
 			}
 			return nil
 		})
 	})
 
-	bot.OnLeaveGroup(func(qqClient *client.QQClient, event *client.GroupLeaveEvent) {
-		bilibiliIds, _, _ := l.bilibiliConcern.ListByGroup(event.Group.Code, nil)
-		douyuIds, _, _ := l.douyuConcern.ListByGroup(event.Group.Code, nil)
-		huyaIds, _, _ := l.huyaConcern.ListByGroup(event.Group.Code, nil)
-		ytbIds, _, _ := l.youtubeConcern.ListByGroup(event.Group.Code, nil)
+	bot.GroupLeaveEvent.Subscribe(func(qqClient *client.QQClient, event *client.GroupLeaveEvent) {
 		log := logger.WithField("GroupCode", event.Group.Code).
 			WithField("GroupName", event.Group.Name).
-			WithField("MemberCount", event.Group.MemberCount).
-			WithField("bilibili订阅数", len(bilibiliIds)).
-			WithField("douyu订阅数", len(douyuIds)).
-			WithField("huya订阅数", len(huyaIds)).
-			WithField("ytb订阅数", len(ytbIds))
+			WithField("MemberCount", event.Group.MemberCount)
+		for _, c := range concern.ListConcern() {
+			_, ids, _, err := c.GetStateManager().ListConcernState(
+				func(groupCode int64, id interface{}, p concern_type.Type) bool {
+					return groupCode == event.Group.Code
+				})
+			if err != nil {
+				log = log.WithField(fmt.Sprintf("%v订阅", c.Site()), "查询失败")
+			} else {
+				log = log.WithField(fmt.Sprintf("%v订阅", c.Site()), len(ids))
+			}
+		}
 		if event.Operator == nil {
 			log.Info("退出群聊")
 		} else {
@@ -349,14 +449,59 @@ func (l *Lsp) Serve(bot *bot.Bot) {
 		l.RemoveAllByGroup(event.Group.Code)
 	})
 
-	bot.OnGroupMessage(func(qqClient *client.QQClient, msg *message.GroupMessage) {
+	bot.GroupNotifyEvent.Subscribe(func(qqClient *client.QQClient, ievent client.INotifyEvent) {
+		switch event := ievent.(type) {
+		case *client.GroupPokeNotifyEvent:
+			data := map[string]interface{}{
+				"member_code":   event.Sender,
+				"receiver_code": event.Receiver,
+				"group_code":    event.GroupCode,
+			}
+			if gi := localutils.GetBot().FindGroup(event.GroupCode); gi != nil {
+				data["group_name"] = gi.Name
+				if fi := gi.FindMember(event.Sender); fi != nil {
+					data["member_name"] = fi.DisplayName()
+				}
+				if fi := gi.FindMember(event.Receiver); fi != nil {
+					data["receiver_name"] = fi.DisplayName()
+				}
+			}
+			m, _ := template.LoadAndExec("trigger.group.poke.tmpl", data)
+			if m != nil {
+				l.SendMsg(m, mmsg.NewGroupTarget(event.GroupCode))
+			}
+		}
+	})
+
+	bot.FriendNotifyEvent.Subscribe(func(qqClient *client.QQClient, ievent client.INotifyEvent) {
+		switch event := ievent.(type) {
+		case *client.FriendPokeNotifyEvent:
+			if event.Receiver == localutils.GetBot().GetUin() {
+				data := map[string]interface{}{
+					"member_code": event.Sender,
+				}
+				if fi := localutils.GetBot().FindFriend(event.Sender); fi != nil {
+					data["member_name"] = fi.Nickname
+				}
+				m, _ := template.LoadAndExec("trigger.private.poke.tmpl", data)
+				if m != nil {
+					l.SendMsg(m, mmsg.NewPrivateTarget(event.Sender))
+				}
+			}
+		}
+	})
+
+	bot.GroupMessageEvent.Subscribe(func(qqClient *client.QQClient, msg *message.GroupMessage) {
 		if len(msg.Elements) <= 0 {
 			return
 		}
 		if err := l.LspStateManager.SaveMessageImageUrl(msg.GroupCode, msg.Id, msg.Elements); err != nil {
 			logger.Errorf("SaveMessageImageUrl failed %v", err)
 		}
-		cmd := NewLspGroupCommand(bot, l, msg)
+		if !l.started.Load() {
+			return
+		}
+		cmd := NewLspGroupCommand(l, msg)
 		if Debug {
 			cmd.Debug()
 		}
@@ -365,7 +510,7 @@ func (l *Lsp) Serve(bot *bot.Bot) {
 		}
 	})
 
-	bot.OnSelfGroupMessage(func(qqClient *client.QQClient, msg *message.GroupMessage) {
+	bot.SelfGroupMessageEvent.Subscribe(func(qqClient *client.QQClient, msg *message.GroupMessage) {
 		if len(msg.Elements) <= 0 {
 			return
 		}
@@ -374,23 +519,26 @@ func (l *Lsp) Serve(bot *bot.Bot) {
 		}
 	})
 
-	bot.OnGroupMuted(func(qqClient *client.QQClient, event *client.GroupMuteEvent) {
+	bot.GroupMuteEvent.Subscribe(func(qqClient *client.QQClient, event *client.GroupMuteEvent) {
 		if err := l.LspStateManager.Muted(event.GroupCode, event.TargetUin, event.Time); err != nil {
 			logger.Errorf("Muted failed %v", err)
 		}
 	})
 
-	bot.OnPrivateMessage(func(qqClient *client.QQClient, msg *message.PrivateMessage) {
+	bot.PrivateMessageEvent.Subscribe(func(qqClient *client.QQClient, msg *message.PrivateMessage) {
+		if !l.started.Load() {
+			return
+		}
 		if len(msg.Elements) == 0 {
 			return
 		}
-		cmd := NewLspPrivateCommand(bot, l, msg)
+		cmd := NewLspPrivateCommand(l, msg)
 		if Debug {
 			cmd.Debug()
 		}
 		go cmd.Execute()
 	})
-	bot.OnDisconnected(func(qqClient *client.QQClient, event *client.ClientDisconnectedEvent) {
+	bot.DisconnectedEvent.Subscribe(func(qqClient *client.QQClient, event *client.ClientDisconnectedEvent) {
 		logger.Errorf("收到OnDisconnected事件 %v", event.Message)
 		if config.GlobalConfig.GetString("bot.onDisconnected") == "exit" {
 			logger.Fatalf("onDisconnected设置为exit，bot将自动退出")
@@ -409,24 +557,31 @@ func (l *Lsp) PostStart(bot *bot.Bot) {
 			l.FreshIndex()
 		}
 	}()
-	l.bilibiliConcern.Start()
-	l.douyuConcern.Start()
-	l.youtubeConcern.Start()
-	l.huyaConcern.Start()
-	l.started = true
+	l.CronjobReload()
+	l.CronStart()
+	concern.StartAll()
+	l.started.Store(true)
+
+	var newVersionChan = make(chan string, 1)
+	go func() {
+		newVersionChan <- CheckUpdate()
+		for range time.Tick(time.Hour * 24) {
+			newVersionChan <- CheckUpdate()
+		}
+	}()
+	go l.NewVersionNotify(newVersionChan)
+
 	logger.Infof("DDBOT启动完成")
 	logger.Infof("D宝，一款真正人性化的单推BOT")
+	if len(l.PermissionStateManager.ListAdmin()) == 0 {
+		logger.Infof("您似乎正在部署全新的BOT，请通过qq对bot私聊发送<%v>(不含括号)获取管理员权限，然后私聊发送<%v>(不含括号)开始使用您的bot",
+			l.CommandShowName(WhosyourdaddyCommand), l.CommandShowName(HelpCommand))
+	}
+
 }
 
 func (l *Lsp) Start(bot *bot.Bot) {
-	if runtime.NumCPU() >= 3 {
-		for i := 0; i < 3; i++ {
-			go l.ConcernNotify(bot)
-		}
-	} else {
-		go l.ConcernNotify(bot)
-	}
-
+	go l.ConcernNotify()
 }
 
 func (l *Lsp) Stop(bot *bot.Bot, wg *sync.WaitGroup) {
@@ -434,12 +589,8 @@ func (l *Lsp) Stop(bot *bot.Bot, wg *sync.WaitGroup) {
 	if l.stop != nil {
 		close(l.stop)
 	}
-
-	l.bilibiliConcern.Stop()
-	l.douyuConcern.Stop()
-	l.huyaConcern.Stop()
-	l.youtubeConcern.Stop()
-	close(l.concernNotify)
+	l.CronStop()
+	concern.StopAll()
 
 	l.wg.Wait()
 	logger.Debug("等待所有推送发送完毕")
@@ -447,25 +598,67 @@ func (l *Lsp) Stop(bot *bot.Bot, wg *sync.WaitGroup) {
 	logger.Debug("推送发送完毕")
 
 	proxy_pool.Stop()
-	if err := localdb.Close(); err != nil {
-		logger.Errorf("close db err %v", err)
+}
+
+func (l *Lsp) NewVersionNotify(newVersionChan <-chan string) {
+	defer func() {
+		if err := recover(); err != nil {
+			logger.WithField("stack", string(debug.Stack())).
+				Errorf("new version notify recoverd %v", err)
+			go l.NewVersionNotify(newVersionChan)
+		}
+	}()
+	for newVersion := range newVersionChan {
+		if newVersion == "" {
+			continue
+		}
+		var newVersionNotify bool
+		err := localdb.RWCover(func() error {
+			key := localdb.DDBotReleaseKey()
+			releaseVersion, err := localdb.Get(key, localdb.IgnoreNotFoundOpt())
+			if err != nil {
+				return err
+			}
+			if releaseVersion != newVersion {
+				newVersionNotify = true
+			}
+			return localdb.Set(key, newVersion)
+		})
+		if err != nil {
+			logger.Errorf("NewVersionNotify error %v", err)
+			continue
+		}
+		if !newVersionNotify {
+			continue
+		}
+		m := mmsg.NewMSG()
+		m.Textf("DDBOT管理员您好，DDBOT有可用更新版本【%v】，请前往 https://github.com/Sora233/DDBOT/releases 查看详细信息\n\n", newVersion)
+		m.Textf("如果您不想接收更新消息，请输入<%v>(不含括号)", l.CommandShowName(NoUpdateCommand))
+		for _, admin := range l.PermissionStateManager.ListAdmin() {
+			if localdb.Exist(localdb.DDBotNoUpdateKey(admin)) {
+				continue
+			}
+			if localutils.GetBot().FindFriend(admin) == nil {
+				continue
+			}
+			logger.WithField("Target", admin).Infof("new ddbot version notify")
+			l.SendMsg(m, mmsg.NewPrivateTarget(admin))
+		}
 	}
 }
 
 func (l *Lsp) FreshIndex() {
-	l.bilibiliConcern.FreshIndex()
-	l.douyuConcern.FreshIndex()
-	l.youtubeConcern.FreshIndex()
-	l.huyaConcern.FreshIndex()
+	for _, c := range concern.ListConcern() {
+		c.FreshIndex()
+	}
 	l.PermissionStateManager.FreshIndex()
 	l.LspStateManager.FreshIndex()
 }
 
 func (l *Lsp) RemoveAllByGroup(groupCode int64) {
-	l.bilibiliConcern.RemoveAllByGroupCode(groupCode)
-	l.douyuConcern.RemoveAllByGroupCode(groupCode)
-	l.youtubeConcern.RemoveAllByGroupCode(groupCode)
-	l.huyaConcern.RemoveAllByGroupCode(groupCode)
+	for _, c := range concern.ListConcern() {
+		c.GetStateManager().RemoveAllByGroupCode(groupCode)
+	}
 	l.PermissionStateManager.RemoveAllByGroupCode(groupCode)
 }
 
@@ -476,23 +669,108 @@ func (l *Lsp) GetImageFromPool(options ...image_pool.OptionFunc) ([]image_pool.I
 	return l.pool.Get(options...)
 }
 
+func (l *Lsp) send(msg *message.SendingMessage, target mmsg.Target) interface{} {
+	switch target.TargetType() {
+	case mmsg.TargetGroup:
+		return l.sendGroupMessage(target.TargetCode(), msg)
+	case mmsg.TargetPrivate:
+		return l.sendPrivateMessage(target.TargetCode(), msg)
+	}
+	panic("unknown target type")
+}
+
+// SendMsg 总是返回至少一个
+func (l *Lsp) SendMsg(m *mmsg.MSG, target mmsg.Target) (res []interface{}) {
+	msgs := m.ToMessage(target)
+	if len(msgs) == 0 {
+		switch target.TargetType() {
+		case mmsg.TargetPrivate:
+			res = append(res, &message.PrivateMessage{Id: -1})
+		case mmsg.TargetGroup:
+			res = append(res, &message.GroupMessage{Id: -1})
+		}
+		return
+	}
+	for idx, msg := range msgs {
+		r := l.send(msg, target)
+		res = append(res, r)
+		if reflect.ValueOf(r).Elem().FieldByName("Id").Int() == -1 {
+			break
+		}
+		if idx > 1 {
+			time.Sleep(time.Millisecond * 300)
+		}
+	}
+	return res
+}
+
+func (l *Lsp) GM(res []interface{}) []*message.GroupMessage {
+	var result []*message.GroupMessage
+	for _, r := range res {
+		result = append(result, r.(*message.GroupMessage))
+	}
+	return result
+}
+
+func (l *Lsp) PM(res []interface{}) []*message.PrivateMessage {
+	var result []*message.PrivateMessage
+	for _, r := range res {
+		result = append(result, r.(*message.PrivateMessage))
+	}
+	return result
+}
+
+func (l *Lsp) sendPrivateMessage(uin int64, msg *message.SendingMessage) (res *message.PrivateMessage) {
+	if bot.Instance == nil || !bot.Instance.Online.Load() {
+		return &message.PrivateMessage{Id: -1, Elements: msg.Elements}
+	}
+	if msg == nil {
+		logger.WithFields(localutils.FriendLogFields(uin)).Debug("send with nil message")
+		return &message.PrivateMessage{Id: -1}
+	}
+	msg.Elements = localutils.MessageFilter(msg.Elements, func(element message.IMessageElement) bool {
+		return element != nil
+	})
+	if len(msg.Elements) == 0 {
+		logger.WithFields(localutils.FriendLogFields(uin)).Debug("send with empty message")
+		return &message.PrivateMessage{Id: -1}
+	}
+	res = bot.Instance.SendPrivateMessage(uin, msg)
+	if res == nil || res.Id == -1 {
+		logger.WithField("content", msgstringer.MsgToString(msg.Elements)).
+			WithFields(localutils.GroupLogFields(uin)).
+			Errorf("发送消息失败")
+	}
+	if res == nil {
+		res = &message.PrivateMessage{Id: -1, Elements: msg.Elements}
+	}
+	return res
+}
+
 // sendGroupMessage 发送一条消息，返回值总是非nil，Id为-1表示发送失败
 // miraigo偶尔发送消息会panic？！
 func (l *Lsp) sendGroupMessage(groupCode int64, msg *message.SendingMessage, recovered ...bool) (res *message.GroupMessage) {
 	defer func() {
 		if e := recover(); e != nil {
 			if len(recovered) == 0 {
+				logger.WithField("content", msgstringer.MsgToString(msg.Elements)).
+					WithField("stack", string(debug.Stack())).
+					Errorf("sendGroupMessage panic recovered")
 				res = l.sendGroupMessage(groupCode, msg, true)
 			} else {
-				logger.WithField("content", localutils.MsgToString(msg.Elements)).
+				logger.WithField("content", msgstringer.MsgToString(msg.Elements)).
 					WithField("stack", string(debug.Stack())).
-					Errorf("sendGroupMessage panic recovered %v", e)
+					Errorf("sendGroupMessage panic recovered but panic again %v", e)
 				res = &message.GroupMessage{Id: -1, Elements: msg.Elements}
 			}
 		}
 	}()
+
+	if bot.Instance == nil || !bot.Instance.Online.Load() {
+		return &message.GroupMessage{Id: -1, Elements: msg.Elements}
+	}
 	if l.LspStateManager.IsMuted(groupCode, bot.Instance.Uin) {
-		logger.WithField("content", localutils.MsgToString(msg.Elements)).
+		logger.WithField("content", msgstringer.MsgToString(msg.Elements)).
 			WithFields(localutils.GroupLogFields(groupCode)).
 			Debug("BOT被禁言无法发送群消息")
 		return &message.GroupMessage{Id: -1, Elements: msg.Elements}
@@ -508,19 +786,16 @@ func (l *Lsp) sendGroupMessage(groupCode int64, msg *message.SendingMessage, rec
 		logger.WithFields(localutils.GroupLogFields(groupCode)).Debug("send with empty message")
 		return &message.GroupMessage{Id: -1}
 	}
-	result := localutils.Retry(2, time.Millisecond*500, func() bool {
-		res = bot.Instance.SendGroupMessage(groupCode, msg)
-		return res != nil && res.Id != -1
-	})
-	if !result {
+	res = bot.Instance.SendGroupMessage(groupCode, msg)
+	if res == nil || res.Id == -1 {
 		if msg.Count(func(e message.IMessageElement) bool {
 			return e.Type() == message.At && e.(*message.AtElement).Target == 0
 		}) > 0 {
-			logger.WithField("content", localutils.MsgToString(msg.Elements)).
+			logger.WithField("content", msgstringer.MsgToString(msg.Elements)).
 				WithFields(localutils.GroupLogFields(groupCode)).
 				Errorf("发送群消息失败，可能是@全员次数用尽")
 		} else {
-			logger.WithField("content", localutils.MsgToString(msg.Elements)).
+			logger.WithField("content", msgstringer.MsgToString(msg.Elements)).
 				WithFields(localutils.GroupLogFields(groupCode)).
 				Errorf("发送群消息失败，可能是被禁言或者账号被风控")
 		}
@@ -531,87 +806,20 @@ func (l *Lsp) sendGroupMessage(groupCode int64, msg *message.SendingMessage, rec
 	return res
 }
 
-// sendChainGroupMessage 发送一串消息，要求前面消息成功才能发后面的消息
-func (l *Lsp) sendChainGroupMessage(groupCode int64, msgs []*message.SendingMessage) []*message.GroupMessage {
-	var res []*message.GroupMessage
-	for _, msg := range msgs {
-		r := l.sendGroupMessage(groupCode, msg)
-		res = append(res, r)
-		if r.Id == -1 {
-			break
-		}
-	}
-	return res
+var Instance = &Lsp{
+	concernNotify:          concern.ReadNotifyChan(),
+	stop:                   make(chan interface{}),
+	status:                 NewStatus(),
+	msgLimit:               semaphore.NewWeighted(3),
+	PermissionStateManager: permission.NewStateManager(),
+	LspStateManager:        NewStateManager(),
+	cron:                   cron.New(cron.WithLogger(cron.VerbosePrintfLogger(cronLog))),
 }
-
-func (l *Lsp) compactTextElements(elements []message.IMessageElement) []message.IMessageElement {
-	var compactMsg []message.IMessageElement
-	sb := strings.Builder{}
-	for _, e := range elements {
-		if e.Type() == message.Text {
-			sb.WriteString(e.(*message.TextElement).Content)
-		} else {
-			if sb.Len() != 0 {
-				compactMsg = append(compactMsg, message.NewText(sb.String()))
-				sb = strings.Builder{}
-			}
-			compactMsg = append(compactMsg, e)
-		}
-	}
-	if sb.Len() != 0 {
-		compactMsg = append(compactMsg, message.NewText(sb.String()))
-	}
-	return compactMsg
-}
-
-func (l *Lsp) getInnerState(ctype concern.Type) *concern_manager.StateManager {
-	switch ctype {
-	case concern.BilibiliNews, concern.BibiliLive:
-		return l.bilibiliConcern.StateManager.StateManager
-	case concern.DouyuLive:
-		return l.douyuConcern.StateManager.StateManager
-	case concern.YoutubeVideo, concern.YoutubeLive:
-		return l.youtubeConcern.StateManager.StateManager
-	case concern.HuyaLive:
-		return l.huyaConcern.StateManager.StateManager
-	default:
-		return nil
-	}
-}
-
-func (l *Lsp) getConcernConfig(groupCode int64, id interface{}, ctype concern.Type) *concern_manager.GroupConcernConfig {
-	state := l.getInnerState(ctype)
-	if state == nil {
-		return nil
-	}
-	return state.GetGroupConcernConfig(groupCode, id)
-}
-
-func (l *Lsp) getConcernConfigNotifyManager(ctype concern.Type, concernConfig *concern_manager.GroupConcernConfig) concern_manager.NotifyManager {
-	if concernConfig == nil {
-		return nil
-	}
-	switch ctype {
-	case concern.BibiliLive, concern.BilibiliNews:
-		return bilibili.NewGroupConcernConfig(concernConfig, l.bilibiliConcern)
-	case concern.DouyuLive:
-		return douyu.NewGroupConcernConfig(concernConfig)
-	case concern.YoutubeLive, concern.YoutubeVideo:
-		return youtube.NewGroupConcernConfig(concernConfig)
-	case concern.HuyaLive:
-		return huya.NewGroupConcernConfig(concernConfig)
-	default:
-		return concernConfig
-	}
-}
-
-var Instance *Lsp
 
 func init() {
-	Instance = &Lsp{
-		concernNotify: make(chan concern.Notify, 500),
-		stop:          make(chan interface{}),
-		status:        NewStatus(),
-	}
 	bot.RegisterModule(Instance)
+
+	template.RegisterExtFunc("currentMode", func() string {
+		return string(Instance.LspStateManager.GetCurrentMode())
+	})
 }

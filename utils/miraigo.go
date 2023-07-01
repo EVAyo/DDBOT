@@ -2,28 +2,20 @@ package utils
 
 import (
 	"bytes"
-	"fmt"
-	"github.com/Logiase/MiraiGo-Template/bot"
+	"errors"
 	"github.com/Mrs4s/MiraiGo/message"
-	"github.com/Sora233/DDBOT/proxy_pool"
+	"github.com/Sora233/MiraiGo-Template/bot"
+	"github.com/samber/lo"
 )
 
 func MessageFilter(msg []message.IMessageElement, filter func(message.IMessageElement) bool) []message.IMessageElement {
-	var result []message.IMessageElement
-	for _, e := range msg {
-		if filter(e) {
-			result = append(result, e)
-		}
-	}
-	return result
+	return lo.Filter(msg, func(e message.IMessageElement, _ int) bool {
+		return filter(e)
+	})
 }
 
-func MessageTextf(format string, args ...interface{}) *message.TextElement {
-	return message.NewText(fmt.Sprintf(format, args...))
-}
-
-func UploadGroupImageByUrl(groupCode int64, url string, isNorm bool, prefer proxy_pool.Prefer) (*message.GroupImageElement, error) {
-	img, err := ImageGet(url, prefer)
+func UploadGroupImageByUrl(groupCode int64, url string, isNorm bool) (*message.GroupImageElement, error) {
+	img, err := ImageGet(url)
 	if err != nil {
 		return nil, err
 	}
@@ -37,11 +29,32 @@ func UploadGroupImage(groupCode int64, img []byte, isNorm bool) (image *message.
 			return nil, err
 		}
 	}
-	image, err = bot.Instance.UploadGroupImage(groupCode, bytes.NewReader(img))
+	if !GetBot().IsOnline() {
+		return nil, errors.New("bot offline")
+	}
+	e, err := bot.Instance.UploadImage(message.Source{SourceType: message.SourceGroup, PrimaryID: groupCode}, bytes.NewReader(img))
 	if err != nil {
 		return nil, err
 	}
-	return image, nil
+	return e.(*message.GroupImageElement), nil
+}
+
+func UploadPrivateImage(uin int64, img []byte, isNorm bool) (*message.FriendImageElement, error) {
+	var err error
+	if isNorm {
+		img, err = ImageNormSize(img)
+		if err != nil {
+			return nil, err
+		}
+	}
+	if !GetBot().IsOnline() {
+		return nil, errors.New("bot offline")
+	}
+	e, err := bot.Instance.UploadImage(message.Source{SourceType: message.SourcePrivate, PrimaryID: uin}, bytes.NewReader(img))
+	if err != nil {
+		return nil, err
+	}
+	return e.(*message.FriendImageElement), nil
 }
 
 const (
@@ -107,8 +120,9 @@ type internalElem struct {
 }
 
 const (
-	internalTypeText       = "text"
-	internalTypeGroupImage = "group_image"
+	internalTypeText        = "text"
+	internalTypeGroupImage  = "group_image"
+	internalTypeFriendImage = "friend_image"
 )
 
 // SerializationElement 序列化消息，只支持图片，文字
@@ -127,6 +141,12 @@ func SerializationElement(e []message.IMessageElement) (string, error) {
 			b, _ := json.Marshal(o)
 			tmp = append(tmp, &internalElem{
 				Type:    internalTypeGroupImage,
+				Content: string(b),
+			})
+		case *message.FriendImageElement:
+			b, _ := json.Marshal(o)
+			tmp = append(tmp, &internalElem{
+				Type:    internalTypeFriendImage,
 				Content: string(b),
 			})
 		default:
@@ -155,6 +175,12 @@ func DeserializationElement(r string) ([]message.IMessageElement, error) {
 			}
 		case internalTypeText:
 			var elem *message.TextElement
+			json.UnmarshalFromString(e.Content, &elem)
+			if elem != nil {
+				result = append(result, elem)
+			}
+		case internalTypeFriendImage:
+			var elem *message.FriendImageElement
 			json.UnmarshalFromString(e.Content, &elem)
 			if elem != nil {
 				result = append(result, elem)

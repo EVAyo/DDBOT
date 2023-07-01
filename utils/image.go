@@ -2,10 +2,8 @@ package utils
 
 import (
 	"bytes"
-	"context"
 	"errors"
 	"fmt"
-	"github.com/Sora233/DDBOT/proxy_pool"
 	"github.com/Sora233/DDBOT/requests"
 	"github.com/Sora233/DDBOT/utils/blockCache"
 	"github.com/ericpauley/go-quantize/quantize"
@@ -20,28 +18,71 @@ import (
 	"time"
 )
 
+func encodeImage(img image.Image, format string, resizedImageBuffer *bytes.Buffer) (err error) {
+	switch format {
+	case "jpeg":
+		err = jpeg.Encode(resizedImageBuffer, img, &jpeg.Options{Quality: 100})
+	case "gif":
+		err = gif.Encode(resizedImageBuffer, img, &gif.Options{
+			Quantizer: quantize.MedianCutQuantizer{},
+		})
+	case "png":
+		err = png.Encode(resizedImageBuffer, img)
+	default:
+		err = fmt.Errorf("unknown format %v", format)
+	}
+	return err
+}
+
 var imageGetCache = blockCache.NewBlockCache(16, 25)
 
-func ImageGet(url string, prefer proxy_pool.Prefer, opt ...requests.Option) ([]byte, error) {
+// ImageGet 默认会对相同的url使用缓存
+func ImageGet(url string, opt ...requests.Option) ([]byte, error) {
 	if url == "" {
 		return nil, errors.New("empty url")
 	}
 	result := imageGetCache.WithCacheDo(url, func() blockCache.ActionResult {
-		ctx, cancel := context.WithTimeout(context.Background(), time.Second*15)
-		defer cancel()
-		opts := []requests.Option{requests.ProxyOption(prefer), requests.TimeoutOption(time.Second * 5)}
+		opts := []requests.Option{
+			requests.TimeoutOption(time.Second * 15),
+			requests.RetryOption(3),
+		}
 		opts = append(opts, opt...)
 
-		resp, err := requests.Get(ctx, url, nil, 3, opts...)
+		var body = new(bytes.Buffer)
+
+		err := requests.Get(url, nil, body, opts...)
 		if err != nil {
 			return blockCache.NewResultWrapper(nil, err)
 		}
-		return blockCache.NewResultWrapper(resp.Content())
+		return blockCache.NewResultWrapper(body.Bytes(), nil)
 	})
 	if result.Err() != nil {
 		return nil, result.Err()
 	}
 	return result.Result().([]byte), nil
+}
+
+// ImageGetWithoutCache 默认情况下相同的url会存在缓存，
+// 如果url会随机返回不同的图片，则需要禁用缓存
+// 这个函数就是不使用缓存的版本
+func ImageGetWithoutCache(url string, opt ...requests.Option) ([]byte, error) {
+	if url == "" {
+		return nil, errors.New("empty url")
+	}
+	var result []byte
+	var err error
+	opts := []requests.Option{
+		requests.TimeoutOption(time.Second * 15),
+		requests.RetryOption(3),
+	}
+	opts = append(opts, opt...)
+	var body = new(bytes.Buffer)
+	err = requests.Get(url, nil, body, opts...)
+	if err != nil {
+		return nil, err
+	}
+	result, err = body.Bytes(), nil
+	return result, err
 }
 
 func ImageNormSize(origImage []byte) ([]byte, error) {
@@ -50,29 +91,26 @@ func ImageNormSize(origImage []byte) ([]byte, error) {
 		return nil, fmt.Errorf("image decode failed %v", err)
 	}
 	resizedImage := resize.Thumbnail(1200, 1200, dImage, resize.Lanczos3)
-	resizedImageBuffer := bytes.NewBuffer(make([]byte, 0))
-	switch format {
-	case "jpeg":
-		err = jpeg.Encode(resizedImageBuffer, resizedImage, &jpeg.Options{Quality: 100})
-	case "gif":
-		err = gif.Encode(resizedImageBuffer, resizedImage, &gif.Options{
-			Quantizer: quantize.MedianCutQuantizer{},
-		})
-	case "png":
-		err = png.Encode(resizedImageBuffer, resizedImage)
-	default:
-		err = fmt.Errorf("unknown format %v", format)
+	buf := bytes.NewBuffer(nil)
+	err = encodeImage(resizedImage, format, buf)
+	if err != nil {
+		return nil, err
 	}
-	return resizedImageBuffer.Bytes(), err
+	return buf.Bytes(), nil
 }
 
-func ImageGetAndNorm(url string, prefer proxy_pool.Prefer) ([]byte, error) {
-	img, err := ImageGet(url, prefer)
+func ImageResize(origImage []byte, width, height uint) ([]byte, error) {
+	dImage, format, err := image.Decode(bytes.NewReader(origImage))
 	if err != nil {
-		return img, err
+		return nil, fmt.Errorf("image decode failed %v", err)
 	}
-	img, err = ImageNormSize(img)
-	return img, err
+	resizedImage := resize.Resize(width, height, dImage, resize.Lanczos3)
+	buf := bytes.NewBuffer(nil)
+	err = encodeImage(resizedImage, format, buf)
+	if err != nil {
+		return nil, err
+	}
+	return buf.Bytes(), nil
 }
 
 func ImageFormat(origImage []byte) (string, error) {

@@ -1,11 +1,11 @@
 package msg_marker
 
 import (
-	"github.com/Logiase/MiraiGo-Template/bot"
-	"github.com/Logiase/MiraiGo-Template/config"
-	"github.com/Logiase/MiraiGo-Template/utils"
 	"github.com/Mrs4s/MiraiGo/client"
 	"github.com/Mrs4s/MiraiGo/message"
+	"github.com/Sora233/MiraiGo-Template/bot"
+	"github.com/Sora233/MiraiGo-Template/config"
+	"github.com/Sora233/MiraiGo-Template/utils"
 	"sync"
 )
 
@@ -41,12 +41,12 @@ func (m *marker) Serve(bot *bot.Bot) {
 		return
 	}
 	logger.Debug("自动已读已开启")
-	bot.OnGroupMessage(func(client *client.QQClient, message *message.GroupMessage) {
+	bot.GroupMessageEvent.Subscribe(func(client *client.QQClient, message *message.GroupMessage) {
 		if message.Sender.Uin != client.Uin {
 			client.MarkGroupMessageReaded(message.GroupCode, int64(message.Id))
 		}
 	})
-	bot.OnPrivateMessage(func(qqClient *client.QQClient, privateMessage *message.PrivateMessage) {
+	bot.PrivateMessageEvent.Subscribe(func(qqClient *client.QQClient, privateMessage *message.PrivateMessage) {
 		if privateMessage.Sender.Uin != qqClient.Uin {
 			qqClient.MarkPrivateMessageReaded(privateMessage.Sender.Uin, int64(privateMessage.Time))
 		}

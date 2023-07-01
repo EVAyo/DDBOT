@@ -1,28 +1,77 @@
-on: [ push, pull_request ]
+name: "CI"
+on:
+  push:
+    branches:
+      - '**'
+  pull_request:
+    branches:
+      - '**'
 jobs:
-
+  # run unittest
   test:
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
-        go: [ '1.16', '1.17' ]
+        go: [ '1.20' ]
 
     steps:
-      - uses: actions/setup-go@v1
+      - uses: actions/setup-go@v3
         with:
           go-version: ${{ matrix.go }}
-      - uses: actions/checkout@v2
-      - run: go test -tags=nocv -v -coverprofile=profile.cov ./...
+      - uses: actions/checkout@v3
+      - run: go test -v -coverprofile=profile.cov ./...
       - name: go vet
         run: |
-          go vet -tags nocv ./...
+          go vet ./...
       - name: Send coverage
         uses: shogo82148/actions-goveralls@v1
         with:
           path-to-profile: profile.cov
           flag-name: Go-${{ matrix.go }}
           parallel: true
+
+  # build binary
+  build:
+    needs: test
+    name: Build binary CI
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        goos: [ linux, windows, darwin ]
+        goarch: [ "386", amd64, arm, arm64 ]
+        exclude:
+          - goos: darwin
+            goarch: arm
+          - goos: darwin
+            goarch: "386"
+      fail-fast: true
+    steps:
+      - uses: actions/checkout@v3
+      - name: Setup Go environment
+        uses: actions/setup-go@v3
+        with:
+          go-version: '1.20'
+      - name: Set env
+        run: |
+          echo BUILD_TIME=$(date --rfc-3339=seconds) >> ${GITHUB_ENV}
+      - name: Build binary file
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+        run: |
+          export BINARY_NAME="DDBOT"
+          if [ $GOOS = "windows" ]; then export BINARY_NAME="$BINARY_NAME.exe"; fi
+          go build -o "$BINARY_NAME" -ldflags '-w -s -X "github.com/Sora233/DDBOT/lsp.BuildTime=${{ env.BUILD_TIME }}" -X github.com/Sora233/DDBOT/lsp.CommitId=${{ github.sha }} -X github.com/Sora233/DDBOT/lsp.Tags=${{ env.Tags }}' github.com/Sora233/DDBOT/cmd
+      - name: Upload artifact
+        uses: actions/upload-artifact@v2
+        if: ${{ !github.head_ref }}
+        with:
+          name: ${{ matrix.goos }}_${{ matrix.goarch }}
+          path: |
+            ./DDBOT
+            ./DDBOT.exe
+
 
   # notifies that all test jobs are finished.
   finish:

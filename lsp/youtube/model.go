@@ -1,11 +1,13 @@
 package youtube
 
 import (
-	"github.com/Mrs4s/MiraiGo/message"
-	"github.com/Sora233/DDBOT/concern"
+	"github.com/Sora233/DDBOT/lsp/concern_type"
+	"github.com/Sora233/DDBOT/lsp/mmsg"
 	"github.com/Sora233/DDBOT/proxy_pool"
+	"github.com/Sora233/DDBOT/requests"
 	localutils "github.com/Sora233/DDBOT/utils"
 	"github.com/sirupsen/logrus"
+	"sync"
 )
 
 type UserInfo struct {
@@ -20,16 +22,10 @@ func (ui *UserInfo) GetChannelName() string {
 	return ui.ChannelName
 }
 
-type EventType int64
-
 const (
-	Video EventType = iota
-	Live
+	Video concern_type.Type = "news"
+	Live  concern_type.Type = "live"
 )
-
-type ConcernEvent interface {
-	Type() EventType
-}
 
 // VideoInfo may be a video or a live, depend on the VideoType
 type VideoInfo struct {
@@ -41,13 +37,37 @@ type VideoInfo struct {
 	VideoStatus    VideoStatus `json:"video_status"`
 	VideoTimestamp int64       `json:"video_timestamp"`
 
-	LiveStatusChanged bool `json:"-"`
+	once              sync.Once
+	msgCache          *mmsg.MSG
+	liveStatusChanged bool
+	liveTitleChanged  bool
+}
+
+func (v *VideoInfo) TitleChanged() bool {
+	return v.liveTitleChanged
+}
+
+func (v *VideoInfo) Living() bool {
+	return v.IsLiving()
+}
+
+func (v *VideoInfo) LiveStatusChanged() bool {
+	return v.liveStatusChanged
+}
+
+func (v *VideoInfo) Site() string {
+	return Site
+}
+
+func (v *VideoInfo) GetUid() interface{} {
+	return v.ChannelId
 }
 
 func (v *VideoInfo) Logger() *logrus.Entry {
 	return logger.WithFields(logrus.Fields{
 		"Site":        Site,
 		"ChannelId":   v.ChannelId,
+		"ChannelName": v.ChannelName,
 		"VideoId":     v.VideoId,
 		"VideoType":   v.VideoType.String(),
 		"VideoTitle":  v.VideoTitle,
@@ -55,7 +75,7 @@ func (v *VideoInfo) Logger() *logrus.Entry {
 	})
 }
 
-func (v *VideoInfo) Type() EventType {
+func (v *VideoInfo) Type() concern_type.Type {
 	if v.IsLive() {
 		return Live
 	} else {
@@ -91,6 +111,26 @@ func (v *VideoInfo) IsVideo() bool {
 	return v.VideoType == VideoType_Video
 }
 
+func (v *VideoInfo) GetMSG() *mmsg.MSG {
+	v.once.Do(func() {
+		m := mmsg.NewMSG()
+		if v.IsLive() {
+			if v.IsLiving() {
+				m.Textf("YTB-%v正在直播：\n%v\n", v.ChannelName, v.VideoTitle)
+			} else {
+				m.Textf("YTB-%v发布了直播预约：\n%v\n时间：%v\n",
+					v.ChannelName, v.VideoTitle, localutils.TimestampFormat(v.VideoTimestamp))
+			}
+		} else if v.IsVideo() {
+			m.Textf("YTB-%s发布了新视频：\n%v\n", v.ChannelName, v.VideoTitle)
+		}
+		m.ImageByUrl(v.Cover, "[封面]", requests.ProxyOption(proxy_pool.PreferOversea))
+		m.Text(VideoViewUrl(v.VideoId) + "\n")
+		v.msgCache = m
+	})
+	return v.msgCache
+}
+
 type Info struct {
 	VideoInfo []*VideoInfo `json:"video_info"`
 	UserInfo
@@ -115,37 +155,16 @@ func NewInfo(vinfo []*VideoInfo) *Info {
 }
 
 type ConcernNotify struct {
-	VideoInfo
+	*VideoInfo
 	GroupCode int64 `json:"group_code"`
 }
 
 func (notify *ConcernNotify) GetGroupCode() int64 {
 	return notify.GroupCode
 }
-func (notify *ConcernNotify) GetUid() interface{} {
-	return notify.ChannelId
-}
 
-func (notify *ConcernNotify) ToMessage() []message.IMessageElement {
-	var result []message.IMessageElement
-	log := notify.Logger()
-	if notify.IsLive() {
-		if notify.IsLiving() {
-			result = append(result, localutils.MessageTextf("YTB-%v正在直播：\n%v\n", notify.ChannelName, notify.VideoTitle))
-		} else {
-			result = append(result, localutils.MessageTextf("YTB-%v发布了直播预约：\n%v\n时间：%v\n", notify.ChannelName, notify.VideoTitle, localutils.TimestampFormat(notify.VideoTimestamp)))
-		}
-	} else if notify.IsVideo() {
-		result = append(result, localutils.MessageTextf("YTB-%s发布了新视频：\n%v\n", notify.ChannelName, notify.VideoTitle))
-	}
-	groupImg, err := localutils.UploadGroupImageByUrl(notify.GroupCode, notify.Cover, false, proxy_pool.PreferOversea)
-	if err != nil {
-		log.WithField("Cover", notify.Cover).Errorf("upload cover failed %v", err)
-	} else {
-		result = append(result, groupImg)
-	}
-	result = append(result, message.NewText(VideoViewUrl(notify.VideoId)+"\n"))
-	return result
+func (notify *ConcernNotify) ToMessage() (m *mmsg.MSG) {
+	return notify.VideoInfo.GetMSG()
 }
 
 func (notify *ConcernNotify) Logger() *logrus.Entry {
@@ -155,20 +174,12 @@ func (notify *ConcernNotify) Logger() *logrus.Entry {
 	return notify.VideoInfo.Logger().WithFields(localutils.GroupLogFields(notify.GroupCode))
 }
 
-func (notify *ConcernNotify) Type() concern.Type {
-	if notify.IsLive() {
-		return concern.YoutubeLive
-	} else {
-		return concern.YoutubeVideo
-	}
-}
-
 func NewConcernNotify(groupCode int64, info *VideoInfo) *ConcernNotify {
 	if info == nil {
 		return nil
 	}
 	return &ConcernNotify{
-		VideoInfo: *info,
+		VideoInfo: info,
 		GroupCode: groupCode,
 	}
 }

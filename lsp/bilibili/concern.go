@@ -1,125 +1,145 @@
 package bilibili
 
 import (
-	"errors"
 	"fmt"
-	"github.com/Logiase/MiraiGo-Template/config"
-	"github.com/Logiase/MiraiGo-Template/utils"
-	"github.com/Sora233/DDBOT/concern"
 	localdb "github.com/Sora233/DDBOT/lsp/buntdb"
-	"github.com/Sora233/DDBOT/lsp/concern_manager"
+	"github.com/Sora233/DDBOT/lsp/cfg"
+	"github.com/Sora233/DDBOT/lsp/concern"
+	"github.com/Sora233/DDBOT/lsp/concern_type"
+	"github.com/Sora233/DDBOT/lsp/mmsg"
 	localutils "github.com/Sora233/DDBOT/utils"
-	"github.com/sirupsen/logrus"
+	"github.com/Sora233/DDBOT/utils/expirable"
+	"github.com/Sora233/MiraiGo-Template/config"
+	"github.com/Sora233/MiraiGo-Template/utils"
 	"github.com/tidwall/buntdb"
-	"golang.org/x/sync/errgroup"
-	"runtime"
-	"strconv"
+	"go.uber.org/atomic"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 )
 
 var logger = utils.GetModuleLogger("bilibili-concern")
 
-type EventType int64
-
 const (
-	Live EventType = iota
-	News
+	Live concern_type.Type = "live"
+	News concern_type.Type = "news"
 )
 
-type ConcernEvent interface {
-	Type() EventType
+type Concern struct {
+	*StateManager
+	attentionListExpirable *expirable.Expirable
+	unsafeStart            atomic.Bool
+	notify                 chan<- concern.Notify
+	stop                   chan interface{}
+	wg                     sync.WaitGroup
+	cacheStartTs           int64
 }
 
-type Concern struct {
-	unsafeStart int32
+func (c *Concern) Site() string {
+	return Site
+}
 
-	*StateManager
-	eventChan chan ConcernEvent
-	notify    chan<- concern.Notify
-	stop      chan interface{}
-	wg        sync.WaitGroup
+func (c *Concern) Types() []concern_type.Type {
+	return []concern_type.Type{Live, News}
+}
+
+func (c *Concern) ParseId(s string) (interface{}, error) {
+	return ParseUid(s)
+}
+
+func (c *Concern) GetStateManager() concern.IStateManager {
+	return c.StateManager
 }
 
 func NewConcern(notify chan<- concern.Notify) *Concern {
 	c := &Concern{
-		StateManager: NewStateManager(),
-		eventChan:    make(chan ConcernEvent, 500),
 		notify:       notify,
 		stop:         make(chan interface{}),
+		cacheStartTs: time.Now().Unix(),
+		attentionListExpirable: expirable.NewExpirable(time.Second*20, func() interface{} {
+			var m = make(map[int64]interface{})
+			resp, err := GetAttentionList()
+			if err != nil {
+				logger.Errorf("GetAttentionList error %v", err)
+				return m
+			}
+			if resp.GetCode() != 0 {
+				logger.Errorf("GetAttentionList error %v - %v", resp.GetCode(), resp.GetMessage())
+				return m
+			}
+			for _, id := range resp.GetData().GetList() {
+				m[id] = struct{}{}
+			}
+			return m
+		}),
 	}
-	lastFresh, _ := c.GetLastFreshTime()
-	if lastFresh > 0 && time.Now().Sub(time.Unix(lastFresh, 0)) > time.Minute*30 {
-		c.unsafeStart = 1
-		time.AfterFunc(time.Minute*3, func() {
-			atomic.StoreInt32(&c.unsafeStart, 0)
-		})
-	}
+	c.StateManager = NewStateManager(c)
 	return c
 }
 
 func (c *Concern) Stop() {
-	logger.Trace("正在停止bilibili StateManager")
-	c.StateManager.Stop()
-	logger.Trace("bilibili StateManager已停止")
+	logger.Trace("正在停止bilibili concern")
 	if c.stop != nil {
 		close(c.stop)
 	}
-	logger.Trace("正在停止bilibili concern")
+	logger.Trace("正在停止bilibili StateManager")
+	c.StateManager.Stop()
+	logger.Trace("bilibili StateManager已停止")
 	c.wg.Wait()
 	logger.Trace("bilibili concern已停止")
 }
 
-func (c *Concern) Start() {
-	err := c.StateManager.Start()
-	if err != nil {
-		logger.Errorf("state manager start err %v", err)
+func (c *Concern) Start() error {
+	Init()
+	lastFresh, _ := c.GetLastFreshTime()
+	if lastFresh > 0 && time.Now().Sub(time.Unix(lastFresh, 0)) > time.Minute*30 {
+		logger.Debug("Unsafe Start Mode")
+		c.unsafeStart.Store(true)
+		time.AfterFunc(time.Minute*3, func() {
+			c.unsafeStart.Store(false)
+		})
 	}
-
+	c.UseNotifyGeneratorFunc(c.notifyGenerator())
 	if !IsVerifyGiven() {
-		logger.Errorf("注意：B站配置不完整，B站相关功能无法使用！")
-		return
-	}
-
-	if runtime.NumCPU() >= 3 {
-		for i := 0; i < 3; i++ {
-			go c.notifyLoop()
-		}
+		logger.Warnf("未设置B站账户，将使用慢速模式，推荐订阅数量不超过5个，否则推送将出现较长延迟，如需更多订阅，推荐您配置使用B站账号，最高可支持2000订阅。")
+		c.UseEmitQueue()
+		c.UseFreshFunc(c.emitQueueFresher())
 	} else {
-		go c.notifyLoop()
-	}
-
-	go c.watchCore()
-	go func() {
-		c.SyncSub()
-
-		tick := time.Tick(time.Hour)
-		for {
-			select {
-			case <-tick:
-				c.SyncSub()
-			case <-c.stop:
-				return
+		c.UseFreshFunc(c.fresh())
+		go func() {
+			c.wg.Add(1)
+			defer c.wg.Done()
+			c.SyncSub()
+			tick := time.Tick(time.Hour)
+			for {
+				select {
+				case <-tick:
+					c.SyncSub()
+				case <-c.stop:
+					return
+				}
 			}
-		}
-	}()
+		}()
+	}
+	return c.StateManager.Start()
 }
 
-func (c *Concern) Add(groupCode int64, mid int64, ctype concern.Type) (*UserInfo, error) {
+func (c *Concern) Add(ctx mmsg.IMsgCtx,
+	groupCode int64, _id interface{}, ctype concern_type.Type) (concern.IdentityInfo, error) {
+	mid := _id.(int64)
+	selfUid := accountUid.Load()
+	var watchSelf = selfUid != 0 && selfUid == mid
 	var err error
 	log := logger.WithFields(localutils.GroupLogFields(groupCode)).WithField("mid", mid)
 
 	err = c.StateManager.CheckGroupConcern(groupCode, mid, ctype)
 	if err != nil {
-		if err == concern_manager.ErrAlreadyExists {
-			return nil, errors.New("已经watch过了")
-		}
-		log.Errorf("CheckGroupConcern error %v", err)
 		return nil, err
 	}
 	var userInfo *UserInfo
+	var liveInfo *LiveInfo
+
+	liveInfo, _ = c.GetLiveInfo(mid)
 
 	userInfo, _ = c.GetUserInfo(mid)
 	if userInfo == nil {
@@ -129,7 +149,7 @@ func (c *Concern) Add(groupCode int64, mid int64, ctype concern.Type) (*UserInfo
 			return nil, fmt.Errorf("查询用户信息失败 %v - %v", mid, err)
 		}
 		if infoResp.Code != 0 {
-			log.WithField("code", infoResp.Code).Errorf(infoResp.Message)
+			log.Errorf("XSpaceAccInfo code error %v - %v", infoResp.Code, infoResp.Message)
 			return nil, fmt.Errorf("查询用户信息失败 %v - %v %v", mid, infoResp.Code, infoResp.Message)
 		}
 
@@ -145,36 +165,57 @@ func (c *Concern) Add(groupCode int64, mid int64, ctype concern.Type) (*UserInfo
 		log.Debugf("UserInfo cache hit")
 	}
 
-	userStat, err := c.StatUserWithCache(mid, time.Hour)
-	if err != nil {
-		log.Errorf("get UserStat error %v\n", err)
-	} else if userStat != nil {
-		if userStat.Follower == 0 {
-			return nil, fmt.Errorf("该用户粉丝数为0，请确认您的订阅目标是否正确，注意使用UID而非直播间ID")
-		}
-		userInfo.UserStat = userStat
-	}
-
-	oldCtype, err := c.StateManager.GetConcern(mid)
-	if err != nil {
-		log.Errorf("GetConcern error %v", err)
-	} else if oldCtype.Empty() {
-		var actType = ActSub
-		if config.GlobalConfig.GetBool("bilibili.hiddenSub") {
-			actType = ActHiddenSub
-		}
-		resp, err := c.ModifyUserRelation(mid, actType)
-		if err != nil {
-			if err == ErrVerifyRequired {
-				log.Errorf("ModifyUserRelation error %v", err)
-				return nil, fmt.Errorf("关注用户失败 - 未配置B站")
-			} else {
-				log.WithField("action", actType).Errorf("ModifyUserRelation error %v", err)
-				return nil, fmt.Errorf("关注用户失败 - 内部错误")
+	if !c.EmitQueueEnabled() {
+		if !c.checkRelation(mid) {
+			userStat, err := c.StatUserWithCache(mid, time.Second*20)
+			if err != nil {
+				log.Errorf("get UserStat error %v\n", err)
+			} else if userStat != nil {
+				var minFollowerCap = cfg.GetBilibiliMinFollowerCap()
+				if !watchSelf && userStat.Follower <= int64(minFollowerCap) {
+					return nil, fmt.Errorf("订阅目标粉丝数未超过%v无法订阅，请确认您的订阅目标是否正确，注意使用UID而非直播间ID", minFollowerCap)
+				}
+				userInfo.UserStat = userStat
 			}
 		}
-		if resp.Code != 0 {
-			return nil, fmt.Errorf("关注用户失败 - %v", resp.GetMessage())
+
+		if !watchSelf {
+			oldCtype, err := c.StateManager.GetConcern(mid)
+			if err != nil {
+				log.Errorf("GetConcern error %v", err)
+			} else if oldCtype.Empty() {
+				if c.checkRelation(mid) {
+					log.Infof("当前B站账户已关注该用户，跳过关注")
+				} else {
+					if cfg.GetBilibiliDisableSub() {
+						return nil, fmt.Errorf("关注用户失败 - 该用户未在关注列表内，请联系管理员")
+					}
+					var actType = ActSub
+					if cfg.GetBilibiliHiddenSub() {
+						actType = ActHiddenSub
+					}
+					resp, err := c.ModifyUserRelation(mid, actType)
+					if err != nil {
+						if err == ErrVerifyRequired {
+							log.Errorf("ModifyUserRelation error %v", err)
+							return nil, fmt.Errorf("关注用户失败 - 未配置B站")
+						} else {
+							log.WithField("action", actType).Errorf("ModifyUserRelation error %v", err)
+							return nil, fmt.Errorf("关注用户失败 - 内部错误")
+						}
+					}
+					if resp.Code != 0 {
+						if resp.Code == 22015 {
+							log.Errorf("关注用户失败 %v - %v | 请尝试手动登陆b站账户关注该用户，如果您已手动关注该用户，请在20秒后重试", resp.GetCode(), resp.GetMessage())
+							return nil, fmt.Errorf("关注用户失败 - %v", resp.GetMessage())
+						}
+						log.Errorf("关注用户失败 %v - %v", resp.GetCode(), resp.GetMessage())
+						return nil, fmt.Errorf("关注用户失败 - %v", resp.GetMessage())
+					}
+				}
+			}
+		} else if selfUid != 0 {
+			log.Debug("正在订阅账号自己，跳过关注")
 		}
 	}
 
@@ -187,17 +228,39 @@ func (c *Concern) Add(groupCode int64, mid int64, ctype concern.Type) (*UserInfo
 	if err != nil && !localdb.IsRollback(err) {
 		log.Errorf("SetUidFirstTimestampIfNotExist failed %v", err)
 	}
-
 	_ = c.StateManager.AddUserInfo(userInfo)
+	if ctype.ContainAny(Live) {
+		// 其他群关注了同一uid，并且推送过Living，那么给新watch的群也推一份
+		if liveInfo != nil && liveInfo.Living() {
+			if ctx.GetTarget().TargetType().IsGroup() {
+				defer c.GroupWatchNotify(groupCode, mid)
+			}
+			if ctx.GetTarget().TargetType().IsPrivate() {
+				defer ctx.Send(mmsg.NewText("检测到该用户正在直播，但由于您目前处于私聊模式，" +
+					"因此不会在群内推送本次直播，将在该用户下次直播时推送"))
+			}
+		}
+	}
+	if userInfo != nil &&
+		userInfo.UserStat != nil &&
+		ctype.ContainAny(Live) &&
+		userInfo.UserStat.Follower < followerNotifyCap {
+		ctx.Send(mmsg.NewTextf("注意：检测到用户【%v】粉丝数少于%v，"+
+			"请确认您的订阅目标是否正确，注意使用UID而非直播间ID", userInfo.Name, followerNotifyCap))
+	}
+
 	return userInfo, nil
 }
 
-func (c *Concern) Remove(groupCode int64, mid int64, ctype concern.Type) (concern.Type, error) {
-	var newCtype concern.Type
-	var allCtype concern.Type
+func (c *Concern) Remove(ctx mmsg.IMsgCtx,
+	groupCode int64, id interface{}, ctype concern_type.Type) (concern.IdentityInfo, error) {
+	mid := id.(int64)
+	var identityInfo concern.IdentityInfo
+	var allCtype concern_type.Type
 	err := c.StateManager.RWCoverTx(func(tx *buntdb.Tx) error {
 		var err error
-		newCtype, err = c.StateManager.RemoveGroupConcern(groupCode, mid, ctype)
+		identityInfo, _ = c.Get(mid)
+		_, err = c.StateManager.RemoveGroupConcern(groupCode, mid, ctype)
 		if err != nil {
 			return err
 		}
@@ -207,7 +270,7 @@ func (c *Concern) Remove(groupCode int64, mid int64, ctype concern.Type) (concer
 		}
 		// 如果已经没有watch live的了，此时应该把liveinfo删掉，否则会无法刷新到livelinfo
 		// 如果此时liveinfo是living状态，则此状态会一直保留，下次watch时会以为在living错误推送
-		if !allCtype.ContainAll(concern.BibiliLive) {
+		if !allCtype.ContainAll(Live) {
 			err = c.StateManager.DeleteLiveInfo(mid)
 			if err == buntdb.ErrNotFound {
 				err = nil
@@ -218,363 +281,42 @@ func (c *Concern) Remove(groupCode int64, mid int64, ctype concern.Type) (concer
 		}
 		return nil
 	})
-	if err == nil && config.GlobalConfig != nil {
-		if config.GlobalConfig.GetBool("bilibili.unsub") && allCtype.Empty() {
-			c.unsubUser(mid)
-		}
+	if err == nil && cfg.GetBilibiliUnsub() && allCtype.Empty() {
+		c.unsubUser(mid)
 	}
-	return newCtype, err
+	if identityInfo == nil {
+		identityInfo = concern.NewIdentity(id, "unknown")
+	}
+	return identityInfo, err
 }
 
-func (c *Concern) ListWatching(groupCode int64, ctype concern.Type) ([]*UserInfo, []concern.Type, error) {
-	log := logger.WithFields(localutils.GroupLogFields(groupCode))
-
-	mids, ctypes, err := c.StateManager.ListByGroup(groupCode, func(id interface{}, p concern.Type) bool {
-		return p.ContainAny(ctype)
-	})
-	if err != nil {
-		return nil, nil, err
-	}
-	var result = make([]*UserInfo, 0, len(mids))
-	var resultTypes = make([]concern.Type, 0, len(mids))
-	for index, mid := range mids {
-		userInfo, err := c.StateManager.GetUserInfo(mid.(int64))
-		if err != nil {
-			log.WithField("mid", mid).Errorf("GetUserInfo error %v", err)
-			continue
-		}
-		result = append(result, userInfo)
-		resultTypes = append(resultTypes, ctypes[index])
-	}
-	return result, resultTypes, nil
+func (c *Concern) Get(id interface{}) (concern.IdentityInfo, error) {
+	return c.FindUser(id.(int64), false)
 }
 
-func (c *Concern) notifyLoop() {
-	c.wg.Add(1)
-	defer c.wg.Done()
-	for ievent := range c.eventChan {
-		switch ievent.Type() {
-		case Live:
-			event := (ievent).(*LiveInfo)
-			log := event.Logger()
-			log.Debugf("new event - live notify")
-
-			groups, _, _, err := c.StateManager.List(func(groupCode int64, id interface{}, p concern.Type) bool {
-				return id.(int64) == event.Mid && p.ContainAny(concern.BibiliLive)
-			})
-			if err != nil {
-				log.Errorf("list id failed %v", err)
-				continue
-			}
-
-			for _, groupCode := range groups {
-				notify := NewConcernLiveNotify(groupCode, event)
-				c.notify <- notify
-				if event.Status == LiveStatus_Living {
-					log.WithFields(localutils.GroupLogFields(groupCode)).Debug("living notify")
-				} else if event.Status == LiveStatus_NoLiving {
-					log.WithFields(localutils.GroupLogFields(groupCode)).Debug("noliving notify")
-				} else {
-					log.WithFields(localutils.GroupLogFields(groupCode)).Error("unknown live status")
-				}
-			}
-		case News:
-			event := (ievent).(*NewsInfo)
-			log := event.Logger()
-			log.Debugf("new event - news notify")
-
-			groups, _, _, err := c.StateManager.List(func(groupCode int64, id interface{}, p concern.Type) bool {
-				return id.(int64) == event.Mid && p.ContainAny(concern.BilibiliNews)
-			})
-			if err != nil {
-				log.Errorf("list id failed %v", err)
-				continue
-			}
-			for _, groupCode := range groups {
-				log.WithFields(localutils.GroupLogFields(groupCode)).Debug("news notify")
-				notifies := NewConcernNewsNotify(groupCode, event, c)
-				for _, notify := range notifies {
-					c.notify <- notify
-				}
-			}
-		}
-
-	}
-}
-
-func (c *Concern) watchCore() {
-	c.wg.Add(1)
-	defer c.wg.Done()
-	t := time.NewTimer(time.Second * 3)
-	for {
-		select {
-		case <-t.C:
-		case <-c.stop:
-			close(c.eventChan)
-			return
-		}
-		start := time.Now()
-		var errGroup errgroup.Group
-
-		errGroup.Go(func() error {
-			defer func() { logger.WithField("cost", time.Now().Sub(start)).Tracef("watchCore dynamic fresh done") }()
-			newsList, err := c.freshDynamicNew()
-			if err != nil {
-				logger.Errorf("freshDynamicNew failed %v", err)
-				return err
+func (c *Concern) notifyGenerator() concern.NotifyGeneratorFunc {
+	return func(groupCode int64, ievent concern.Event) (result []concern.Notify) {
+		log := ievent.Logger()
+		switch event := ievent.(type) {
+		case *LiveInfo:
+			if event.Status == LiveStatus_Living {
+				log.WithFields(localutils.GroupLogFields(groupCode)).Trace("living notify")
+			} else if event.Status == LiveStatus_NoLiving {
+				log.WithFields(localutils.GroupLogFields(groupCode)).Trace("noliving notify")
 			} else {
-				for _, news := range newsList {
-					c.eventChan <- news
-				}
+				log.WithFields(localutils.GroupLogFields(groupCode)).Error("unknown live status")
 			}
-			return nil
-		})
-
-		errGroup.Go(func() error {
-			defer func() { logger.WithField("cost", time.Now().Sub(start)).Tracef("watchCore live fresh done") }()
-			liveInfo, err := c.freshLive()
-			if err != nil {
-				logger.Errorf("freshLive error %v", err)
-				return err
+			result = append(result, NewConcernLiveNotify(groupCode, event))
+		case *NewsInfo:
+			notifies := NewConcernNewsNotify(groupCode, event, c)
+			log.WithFields(localutils.GroupLogFields(groupCode)).
+				WithField("Size", len(notifies)).Trace("news notify")
+			for _, notify := range notifies {
+				result = append(result, notify)
 			}
-			var liveInfoMap = make(map[int64]*LiveInfo)
-			for _, info := range liveInfo {
-				liveInfoMap[info.Mid] = info
-			}
-
-			_, ids, types, err := c.List(func(groupCode int64, id interface{}, p concern.Type) bool {
-				return p.ContainAny(concern.BibiliLive)
-			})
-			if err != nil {
-				logger.Errorf("List error %v", err)
-				return err
-			}
-			ids, types, err = c.GroupTypeById(ids, types)
-			if err != nil {
-				logger.Errorf("GroupTypeById error %v", err)
-				return err
-			}
-
-			sendLiveInfo := func(info *LiveInfo) {
-				addLiveInfoErr := c.AddLiveInfo(info)
-				if addLiveInfoErr != nil {
-					// 如果因为系统原因add失败，会造成重复推送
-					// 按照ddbot的原则，选择不推送，而非重复推送
-					logger.WithField("mid", info.Mid).Errorf("add live info error %v", err)
-				} else {
-					c.eventChan <- info
-				}
-			}
-
-			for _, id := range ids {
-				mid := id.(int64)
-				oldInfo, _ := c.GetLiveInfo(mid)
-				if oldInfo == nil {
-					// first live info
-					if newInfo, found := liveInfoMap[mid]; found {
-						newInfo.LiveStatusChanged = true
-						sendLiveInfo(newInfo)
-					}
-					continue
-				}
-				if oldInfo.Status == LiveStatus_NoLiving {
-					if newInfo, found := liveInfoMap[mid]; found {
-						// notliving -> living
-						newInfo.LiveStatusChanged = true
-						sendLiveInfo(newInfo)
-					}
-				} else if oldInfo.Status == LiveStatus_Living {
-					if newInfo, found := liveInfoMap[mid]; !found {
-						// living -> notliving
-						if count := c.IncNotLiveCount(mid); count < 3 {
-							logger.WithField("uid", mid).WithField("name", oldInfo.UserInfo.Name).
-								WithField("notlive_count", count).
-								Debug("notlive counting")
-							continue
-						} else {
-							logger.WithField("uid", mid).WithField("name", oldInfo.UserInfo.Name).
-								Debug("notlive count done, notlive confirmed")
-						}
-						c.ClearNotLiveCount(mid)
-						newInfo = NewLiveInfo(&oldInfo.UserInfo, oldInfo.LiveTitle, oldInfo.Cover, LiveStatus_NoLiving)
-						newInfo.LiveStatusChanged = true
-						sendLiveInfo(newInfo)
-					} else {
-						if newInfo.LiveTitle == "bilibili主播的直播间" {
-							newInfo.LiveTitle = oldInfo.LiveTitle
-						}
-						c.ClearNotLiveCount(mid)
-						if newInfo.LiveTitle != oldInfo.LiveTitle {
-							// live title change
-							newInfo.LiveTitleChanged = true
-							sendLiveInfo(newInfo)
-						}
-					}
-				}
-			}
-			return nil
-		})
-		err := errGroup.Wait()
-		end := time.Now()
-		if err == nil {
-			logger.WithField("cost", end.Sub(start)).Tracef("watchCore loop done")
-			c.SetLastFreshTime(time.Now().Unix())
-		} else {
-			logger.WithField("cost", end.Sub(start)).Errorf("watchCore error %v", err)
 		}
-		t.Reset(config.GlobalConfig.GetDuration("bilibili.interval"))
+		return
 	}
-}
-
-func (c *Concern) freshDynamicNew() ([]*NewsInfo, error) {
-	var start = time.Now()
-	resp, err := DynamicSrvDynamicNew()
-	if err != nil {
-		return nil, err
-	}
-	var newsMap = make(map[int64][]*Card)
-	if resp.GetCode() != 0 {
-		logger.WithField("code", resp.GetCode()).
-			WithField("msg", resp.GetMessage()).
-			Errorf("fresh dynamic new failed")
-		return nil, errors.New(resp.Message)
-	}
-	logger.WithField("cost", time.Now().Sub(start)).Trace("freshDynamicNew cost 1")
-	for _, card := range resp.GetData().GetCards() {
-		uid := card.GetDesc().GetUid()
-		// 应该用dynamic_id_str
-		// 但好像已经没法保持向后兼容同时改动了
-		// 只能相信概率论了，出问题的概率应该比较小，出问题会导致推送丢失
-		replaced, err := c.MarkDynamicId(card.GetDesc().GetDynamicId())
-		if err != nil || replaced {
-			if err != nil {
-				logger.WithField("uid", uid).
-					WithField("dynamicId", card.GetDesc().GetDynamicId()).
-					Errorf("MarkDynamicId error %v", err)
-			}
-			continue
-		}
-		ts, err := c.StateManager.GetUidFirstTimestamp(uid)
-		if err == nil && card.GetDesc().GetTimestamp() < ts {
-			logger.WithField("uid", uid).
-				WithField("dynamicId", card.GetDesc().GetDynamicId()).
-				Debugf("past news skip")
-			continue
-		}
-		newsMap[uid] = append(newsMap[uid], card)
-	}
-	logger.WithField("cost", time.Now().Sub(start)).Trace("freshDynamicNew cost 2")
-	var result []*NewsInfo
-	for uid, cards := range newsMap {
-		userInfo, err := c.StateManager.GetUserInfo(uid)
-		if err == buntdb.ErrNotFound {
-			continue
-		} else if err != nil {
-			logger.WithField("mid", uid).Debugf("find user info error %v", err)
-			continue
-		}
-		if len(cards) > 0 {
-			// 如果更新了名字，有机会在这里捞回来
-			userInfo.Name = cards[0].GetDesc().GetUserProfile().GetInfo().GetUname()
-		}
-		if len(cards) > 3 {
-			// 有时候b站抽风会刷屏
-			cards = cards[:3]
-		}
-		result = append(result, NewNewsInfoWithDetail(userInfo, cards))
-	}
-	logger.WithField("cost", time.Now().Sub(start)).WithField("NewsInfo Size", len(result)).Trace("freshDynamicNew done")
-	return result, nil
-}
-
-// return all LiveInfo in LiveStatus_Living
-func (c *Concern) freshLive() ([]*LiveInfo, error) {
-	var start = time.Now()
-	var liveInfo []*LiveInfo
-	var infoSet = make(map[int64]bool)
-	var page = 1
-	var maxPage int32 = 1
-	var zeroCount = 0
-	for {
-		resp, err := FeedList(FeedPageOpt(page))
-		if err != nil {
-			logger.Errorf("freshLive FeedList error %v", err)
-			return nil, err
-		} else if resp.GetCode() != 0 {
-			if resp.GetCode() == -101 && strings.Contains(resp.GetMessage(), "未登录") {
-				logger.Errorf("刷新直播列表失败，可能是cookie失效，将尝试重新获取cookie")
-				ClearCookieInfo(username)
-				atomicVerifyInfo.Store(new(VerifyInfo))
-			} else if resp.GetCode() == -400 {
-				logger.Errorf("刷新直播列表失败，可能是自动登陆失败，请查看文档尝试手动设置b站cookie")
-			} else {
-				logger.Errorf("freshLive FeedList code %v msg %v", resp.GetCode(), resp.GetMessage())
-			}
-			return nil, fmt.Errorf("freshLive FeedList error code %v msg %v", resp.GetCode(), resp.GetMessage())
-		}
-		var (
-			dataSize    = len(resp.GetData().GetList())
-			pageSize, _ = strconv.ParseInt(resp.GetData().GetPagesize(), 10, 32)
-			curTotal    = resp.GetData().GetResults()
-			curMaxPage  = (curTotal-1)/int32(pageSize) + 1
-		)
-		logger.WithFields(logrus.Fields{
-			"CurTotal":   curTotal,
-			"PageSize":   pageSize,
-			"CurMaxPage": curMaxPage,
-			"maxPage":    maxPage,
-			"page":       page,
-		}).Trace("freshLive debug")
-		if curMaxPage > maxPage {
-			maxPage = curMaxPage
-		}
-		for _, l := range resp.GetData().GetList() {
-			if infoSet[l.GetUid()] {
-				continue
-			}
-			infoSet[l.GetUid()] = true
-			info := NewLiveInfo(
-				NewUserInfo(l.GetUid(), l.GetRoomid(), l.GetUname(), l.GetLink()),
-				l.GetTitle(),
-				l.GetPic(),
-				LiveStatus_Living,
-			)
-			if info.Cover == "" {
-				info.Cover = l.GetCover()
-			}
-			if info.Cover == "" {
-				info.Cover = l.GetFace()
-			}
-			liveInfo = append(liveInfo, info)
-		}
-		if dataSize != 0 {
-			zeroCount = 0
-			page++
-		} else {
-			zeroCount += 1
-		}
-		if int32(page) > maxPage {
-			break
-		}
-		if zeroCount >= 3 {
-			// 认为是真的无人在直播，可能是关注比较少
-			if maxPage > 1 {
-				logger.WithFields(logrus.Fields{
-					"Page":          page,
-					"MaxPage":       maxPage,
-					"LiveInfo Size": len(liveInfo),
-				}).Errorf("直播信息刷新异常结束，如果该信息没有频繁出现，可以忽略。")
-			}
-			break
-		}
-	}
-	logger.WithFields(logrus.Fields{
-		"cost":          time.Since(start),
-		"Page":          page,
-		"MaxPage":       maxPage,
-		"LiveInfo Size": len(liveInfo),
-	}).Tracef("freshLive done")
-	return liveInfo, nil
 }
 
 func (c *Concern) FindUser(mid int64, load bool) (*UserInfo, error) {
@@ -591,7 +333,13 @@ func (c *Concern) FindUser(mid int64, load bool) (*UserInfo, error) {
 			resp.GetData().GetName(),
 			resp.GetData().GetLiveRoom().GetUrl(),
 		)
-		err = c.StateManager.AddUserInfo(newUserInfo)
+		newLiveInfo := NewLiveInfo(newUserInfo,
+			resp.GetData().GetLiveRoom().GetTitle(),
+			resp.GetData().GetLiveRoom().GetCover(),
+			resp.GetData().GetLiveRoom().GetLiveStatus(),
+		)
+		// AddLiveInfo 会顺便添加UserInfo
+		err = c.StateManager.AddLiveInfo(newLiveInfo)
 		if err != nil {
 			return nil, err
 		}
@@ -612,7 +360,7 @@ func (c *Concern) StatUserWithCache(mid int64, expire time.Duration) (*UserStat,
 		return nil, fmt.Errorf("code:%v %v", resp.GetCode(), resp.GetMessage())
 	}
 	userStat = NewUserStat(mid, resp.GetData().GetFollowing(), resp.GetData().GetFollower())
-	err = c.StateManager.AddUserStat(userStat, localdb.ExpireOption(expire))
+	err = c.StateManager.AddUserStat(userStat, expire)
 	if err != nil {
 		return nil, err
 	}
@@ -620,7 +368,15 @@ func (c *Concern) StatUserWithCache(mid int64, expire time.Duration) (*UserStat,
 }
 
 func (c *Concern) ModifyUserRelation(mid int64, act int) (*RelationModifyResponse, error) {
-	resp, err := RelationModify(mid, act)
+	var resp *RelationModifyResponse
+	var err error
+	// b站好像有新灰度，-111代表 csrf校验失败
+	// 只有shjd这个idc会返回这个错误
+	// 当返回-111的时候重试一下
+	localutils.Retry(3, time.Millisecond*300, func() bool {
+		resp, err = RelationModify(mid, act)
+		return err != nil || resp.GetCode() != -111
+	})
 	if err != nil {
 		return nil, err
 	}
@@ -651,35 +407,59 @@ func (c *Concern) SyncSub() {
 	}
 	var midSet = make(map[int64]bool)
 	var attentionMidSet = make(map[int64]bool)
-	_, _, _, err = c.List(func(groupCode int64, id interface{}, p concern.Type) bool {
+	_, _, _, err = c.StateManager.ListConcernState(func(groupCode int64, id interface{}, p concern_type.Type) bool {
 		midSet[id.(int64)] = true
 		return true
 	})
 
 	if err != nil {
-		logger.Errorf("SyncSub List all error %v", err)
+		logger.Errorf("SyncSub ListConcernState all error %v", err)
 		return
 	}
 	for _, attentionMid := range resp.GetData().GetList() {
 		attentionMidSet[attentionMid] = true
 	}
 
+	var disableSub = false
+	if config.GlobalConfig.GetBool("bilibili.disableSub") {
+		disableSub = true
+	}
 	var actType = ActSub
 	if config.GlobalConfig.GetBool("bilibili.hiddenSub") {
 		actType = ActHiddenSub
 	}
 
 	for mid := range midSet {
+		if mid == accountUid.Load() {
+			continue
+		}
 		if _, found := attentionMidSet[mid]; !found {
+			if disableSub {
+				logger.Warnf("检测到存在未关注的订阅目标 UID:%v，同时禁用了b站自动关注，将无法推送该用户", mid)
+				continue
+			}
 			resp, err := c.ModifyUserRelation(mid, actType)
-			if err == nil && resp.Code == 22002 {
-				// 可能是被拉黑了
-				logger.WithField("ModifyUserRelation Code", 22002).
-					WithField("mid", mid).
-					Errorf("ModifyUserRelation failed, remove concern")
-				c.RemoveAllById(mid)
+			if err == nil {
+				switch resp.Code {
+				case 22002, 22003, 22013:
+					// 22002 可能是被拉黑了
+					// 22003 主动拉黑对方
+					// 22013 帐号注销
+					logger.WithField("ModifyUserRelation Code", resp.Code).
+						WithField("ModifyUserRelation Message", resp.Message).
+						WithField("mid", mid).
+						Errorf("ModifyUserRelation failed, remove concern")
+					c.RemoveAllById(mid)
+				}
+			} else {
+				logger.Errorf("ModifyUserRelation error %v", err)
 			}
 			time.Sleep(time.Second * 3)
+			select {
+			case <-c.stop:
+				return
+			default:
+			}
 		}
 	}
 }
@@ -693,37 +473,16 @@ func (c *Concern) FindOrLoadUser(mid int64) (*UserInfo, error) {
 }
 
 func (c *Concern) FindUserLiving(mid int64, load bool) (*LiveInfo, error) {
-	userInfo, err := c.FindUser(mid, load)
+	_, err := c.FindUser(mid, load)
 	if err != nil {
 		return nil, err
 	}
-
-	var liveInfo *LiveInfo
-
-	if load {
-		roomInfo, err := GetRoomInfoOld(userInfo.Mid)
-		if err != nil {
-			return nil, err
-		}
-		if roomInfo.Code != 0 {
-			return nil, fmt.Errorf("code:%v %v", roomInfo.Code, roomInfo.Message)
-		}
-		liveInfo = NewLiveInfo(userInfo,
-			roomInfo.GetData().GetTitle(),
-			roomInfo.GetData().GetCover(),
-			roomInfo.GetData().GetLiveStatus(),
-		)
-		_ = c.StateManager.AddLiveInfo(liveInfo)
-	}
-
-	if liveInfo != nil {
-		return liveInfo, nil
-	}
+	// FindUser会顺便刷新LiveInfo，所以这里不用再刷新了
 	return c.StateManager.GetLiveInfo(mid)
 }
 
 func (c *Concern) FindUserNews(mid int64, load bool) (*NewsInfo, error) {
-	userInfo, err := c.FindUser(mid, load)
+	userInfo, err := c.FindOrLoadUser(mid)
 	if err != nil {
 		return nil, err
 	}
@@ -750,14 +509,14 @@ func (c *Concern) FindUserNews(mid int64, load bool) (*NewsInfo, error) {
 func (c *Concern) GroupWatchNotify(groupCode, mid int64) {
 	liveInfo, _ := c.GetLiveInfo(mid)
 	if liveInfo.Living() {
-		liveInfo.LiveStatusChanged = true
+		liveInfo.liveStatusChanged = true
 		c.notify <- NewConcernLiveNotify(groupCode, liveInfo)
 	}
 }
 
 func (c *Concern) RemoveAllByGroupCode(groupCode int64) ([]string, error) {
 	keys, err := c.StateManager.RemoveAllByGroupCode(groupCode)
-	if config.GlobalConfig != nil && config.GlobalConfig.GetBool("bilibili.unsub") {
+	if cfg.GetBilibiliUnsub() {
 		var changedIdSet = make(map[int64]interface{})
 		if err == nil {
 			for _, key := range keys {
@@ -776,7 +535,7 @@ func (c *Concern) RemoveAllByGroupCode(groupCode int64) ([]string, error) {
 					if err != nil {
 						continue
 					}
-					if !ctype.ContainAll(concern.BibiliLive) {
+					if !ctype.ContainAll(Live) {
 						c.StateManager.DeleteLiveInfo(mid)
 					}
 				}
@@ -804,4 +563,55 @@ func (c *Concern) unsubUser(mid int64) {
 	} else {
 		logger.WithField("mid", mid).Info("取消关注成功")
 	}
+}
+
+func (c *Concern) checkRelation(mid int64) bool {
+	var atr = c.attentionListExpirable.Do()
+	if atr == nil {
+		return false
+	}
+	var matr = atr.(map[int64]interface{})
+	if _, found := matr[mid]; found {
+		return true
+	} else {
+		return false
+	}
+}
+
+func (c *Concern) filterCard(card *Card) bool {
+	// 2021-08-15 发现好像是系统推荐的直播间，非人为操作
+	// 在event阶段过滤掉
+	if card.GetDesc().GetType() == DynamicDescType_WithLiveV2 {
+		return false
+	}
+	uid := card.GetDesc().GetUid()
+	// 应该用dynamic_id_str
+	// 但好像已经没法保持向后兼容同时改动了
+	// 只能相信概率论了，出问题的概率应该比较小，出问题会导致推送丢失
+	replaced, err := c.MarkDynamicId(card.GetDesc().GetDynamicId())
+	if err != nil {
+		logger.WithField("uid", uid).
+			WithField("dynamicId", card.GetDesc().GetDynamicId()).
+			Errorf("MarkDynamicId error %v", err)
+		return false
+	}
+	if replaced {
+		return false
+	}
+	var tsLimit int64
+	if cfg.GetBilibiliOnlyOnlineNotify() {
+		tsLimit = c.cacheStartTs
+	} else {
+		tsLimit, err = c.StateManager.GetUidFirstTimestamp(uid)
+		if err != nil {
+			return true
+		}
+	}
+	if card.GetDesc().GetTimestamp() < tsLimit {
+		logger.WithField("uid", uid).
+			WithField("dynamicId", card.GetDesc().GetDynamicId()).
+			Trace("past news skip")
+		return false
+	}
+	return true
 }
